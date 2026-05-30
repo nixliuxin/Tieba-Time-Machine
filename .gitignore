@@ -1,0 +1,51 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg
+.venv/
+venv/
+env/
+
+# Node / Frontend
+node_modules/
+frontend/dist/
+frontend/.vite/
+
+# IDE / AI tools
+.vscode/
+.idea/
+.cursor/
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Secrets & auth
+tieba_auth.json
+cookies.json
+auth.json
+.env.local
+.env
+
+# Runtime config (contains local paths)
+server/sources.json
+
+# Runtime data
+scraped_data/
+*.log
+_logs/
+_done_tids.json
+*.lock
+
+# Archives output (user data, not source)
+*.tar
+*.par2
+*.vol*
+media_index.json
+master.db
