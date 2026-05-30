@@ -1,0 +1,81 @@
+@import "tailwindcss";
+@import "tw-animate-css";
+@import "shadcn/tailwind.css";
+
+@import "./tokens/index.css";
+@import "./base/index.css";
+@import "@fontsource-variable/geist";
+
+@custom-variant light (&:not(.dark *));
+@custom-variant dark (&:is(.dark *));
+
+/* shadcn base layer styles */
+@layer base {
+  ::after,
+  ::before,
+  ::backdrop,
+  ::file-selector-button {
+    border-color: var(--border, currentColor);
+  }
+
+  * {
+    @apply border-border outline-ring/50;
+  }
+
+  body {
+    background: #ffffff;
+    color: #222;
+    font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+    font-size: 14px;
+    line-height: 1.6;
+    margin: 0;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+
+  html {
+    font-size: 14px;
+  }
+
+  /* Typography scale:
+     h1: 20px bold  - page titles
+     h2: 16px bold  - section titles
+     h3: 15px bold  - card titles
+     h4: 13px bold  - small headings
+     body: 14-15px  - content text
+     small: 12px    - meta/caption
+     xs: 11px       - timestamps, hints
+     xxs: 10px      - badges
+  */
+
+  h1, h2, h3, h4, h5, h6 {
+    margin: 0;
+    font-weight: 700;
+  }
+
+  a {
+    text-decoration: none;
+    color: inherit;
+  }
+
+  /* Custom scrollbar */
+  ::-webkit-scrollbar {
+    width: 6px;
+    height: 6px;
+  }
+  ::-webkit-scrollbar-thumb {
+    background: #d0d0d0;
+    border-radius: 3px;
+  }
+  ::-webkit-scrollbar-thumb:hover {
+    background: #b0b0b0;
+  }
+  ::-webkit-scrollbar-track {
+    background: transparent;
+  }
+
+  /* Selection */
+  ::selection {
+    background: #4096ff33;
+  }
+}

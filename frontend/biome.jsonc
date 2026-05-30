@@ -1,0 +1,102 @@
+{
+  "$schema": "./node_modules/@biomejs/biome/configuration_schema.json",
+  "extends": ["ultracite/biome/core", "ultracite/biome/react"],
+  "vcs": {
+    "enabled": true,
+    "clientKind": "git",
+    "useIgnoreFile": true
+  },
+  "files": {
+    "ignoreUnknown": false,
+    "includes": [
+      "!src/routeTree.gen.ts",
+      "!src/components/animate-ui",
+      "!src/components/magicui",
+      "!src/components/vendor",
+      "!src/pages/home/sections/feature-animation",
+      "!src/styles",
+      "!dist",
+      "!build",
+      "!.vite",
+      "!coverage",
+      "!*.config.js",
+      "!*.config.ts",
+      "!vite-env.d.ts",
+      "!_api",
+      "!api",
+      "!scripts",
+      "!public",
+      "!docs",
+      "!figma"
+    ]
+  },
+  "formatter": {
+    "enabled": true,
+    "indentStyle": "space",
+    "indentWidth": 2,
+    "lineWidth": 100,
+    "lineEnding": "lf"
+  },
+  "linter": {
+    "enabled": true,
+    "rules": {
+      "correctness": {
+        "useExhaustiveDependencies": "error",
+        "noUndeclaredVariables": "error"
+      },
+      "suspicious": {
+        "noExplicitAny": "warn",
+        "noArrayIndexKey": "warn"
+      },
+      "style": {
+        "noNegationElse": "off",
+        "noNestedTernary": "off",
+        "useBlockStatements": "off"
+      },
+      "performance": {
+        "noBarrelFile": "off"
+      }
+    }
+  },
+  "javascript": {
+    "formatter": {
+      "quoteStyle": "single",
+      "trailingCommas": "es5",
+      "semicolons": "asNeeded",
+      "arrowParentheses": "asNeeded",
+      "bracketSpacing": true,
+      "bracketSameLine": false
+    }
+  },
+  "json": {
+    "formatter": {
+      "enabled": true,
+      "indentStyle": "space",
+      "indentWidth": 2
+    }
+  },
+  "overrides": [
+    {
+      "includes": ["src/components/ui/**", "src/os/components/ui/**"],
+      "linter": {
+        "enabled": false
+      }
+    },
+    {
+      "includes": ["src/lib/**", "src/hooks/**"],
+      "linter": {
+        "enabled": false
+      }
+    },
+    {
+      "includes": [
+        "src/index.css",
+        "src/colors.css",
+        "src/os/apps/resume/resume-print.css"
+      ],
+      "linter": {
+        "enabled": false
+      }
+    }
+  ]
+}
