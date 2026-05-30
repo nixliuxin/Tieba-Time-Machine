@@ -357,11 +357,23 @@ def merge_one_forum(source_forum_dir: str, forum_dir_name: str, output_dir: str)
     conn.close()
 
 
+def remove_source_dir(source_forum_dir: str, forum_dir_name: str):
+    """Remove the source forum directory after successful merge."""
+    import shutil
+    print(f"  Cleaning up source: {source_forum_dir}")
+    shutil.rmtree(source_forum_dir)
+    print(f"  Removed: {forum_dir_name}/")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Merge Tieba archives into per-forum master.db files")
     parser.add_argument("--source", required=True, help="Source data directory (e.g. ./scraped_data)")
     parser.add_argument("--output", required=True, help="Output root directory (e.g. ./archives)")
     parser.add_argument("--forum", default=None, help="Only process the specified forum (directory name)")
+    parser.add_argument(
+        "--keep-raw", action="store_true", default=False,
+        help="Keep raw source files after merge (default: delete after successful merge)",
+    )
     args = parser.parse_args()
 
     source_dir = args.source
@@ -377,9 +389,13 @@ def main():
                 forum_dirs.append((name, full))
 
     print(f"Found {len(forum_dirs)} forum directories")
+    if not args.keep_raw:
+        print("  (raw source will be deleted after successful merge; use --keep-raw to retain)")
 
     for forum_dir_name, forum_path in forum_dirs:
         merge_one_forum(forum_path, forum_dir_name, output_dir)
+        if not args.keep_raw:
+            remove_source_dir(forum_path, forum_dir_name)
 
     print(f"\nAll done! Output directory: {output_dir}")
     for name in sorted(os.listdir(output_dir)):

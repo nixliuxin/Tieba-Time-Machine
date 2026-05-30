@@ -38,6 +38,11 @@
 - **Zero server** — Runs entirely on your machine, never uploads data anywhere
 - **Open source** — Fully auditable code, no telemetry or tracking
 
+**Pipeline:** Scrape → merge into master.db → pack media → PAR2 verification → local reading
+
+> After a successful merge, raw scraped files are deleted by default (`--keep-raw` to retain).  
+> The archive is the single source of truth — incremental updates and schema migrations operate directly on it.
+
 ---
 
 ## Quick Start
