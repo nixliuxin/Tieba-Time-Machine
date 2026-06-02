@@ -41,6 +41,7 @@ from backup_lib import (
     batch_download,
     log,
     read_bduss,
+    verify_bduss,
 )
 
 
@@ -133,6 +134,7 @@ async def main_async(args):
 
     bduss = read_bduss()
     init_archiver(output_dir, bduss=bduss)
+    await verify_bduss()
 
     tids = load_tids_from_cache(output_dir)
     if tids is None:
