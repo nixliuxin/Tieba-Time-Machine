@@ -46,9 +46,15 @@ def load_meta(output_dir: str) -> dict | None:
 
 def save_meta(output_dir: str, forum_name: str):
     path = os.path.join(output_dir, META_FILE)
+    existing = {}
+    if os.path.exists(path):
+        with open(path, "r", encoding="utf-8") as f:
+            existing = json.load(f)
+    existing.setdefault("forum", forum_name)
+    existing.setdefault("type", "forum")
+    existing.setdefault("created_at", time.strftime("%Y-%m-%d %H:%M:%S"))
     with open(path, "w", encoding="utf-8") as f:
-        json.dump({"forum": forum_name, "created_at": time.strftime("%Y-%m-%d %H:%M:%S")},
-                  f, ensure_ascii=False, indent=2)
+        json.dump(existing, f, ensure_ascii=False, indent=2)
 
 
 def load_tids(output_dir: str) -> list[int] | None:
@@ -66,25 +72,64 @@ def load_tids(output_dir: str) -> list[int] | None:
     return None
 
 
+async def _fetch_page(client, forum_name: str, pn: int, max_retries: int = 4) -> list | None:
+    """Fetch a single page with retry and backoff. Returns thread list or None."""
+    backoff = 5
+    for attempt in range(1, max_retries + 1):
+        try:
+            threads = await client.get_threads(forum_name, pn=pn)
+            return list(threads) if threads else []
+        except Exception as e:
+            err = str(e)
+            if "429" in err:
+                wait = backoff * attempt
+                log(f"  [429] Page {pn}, waiting {wait}s (attempt {attempt}/{max_retries})")
+                await asyncio.sleep(wait)
+            else:
+                log(f"  [ERROR] Page {pn} attempt {attempt}/{max_retries}: {err[:120]}")
+                await asyncio.sleep(2 * attempt)
+    return None
+
+
+async def _find_max_page(client, forum_name: str) -> int:
+    """Binary search for the last non-empty page."""
+    lo, hi, best = 1, 5000, 1
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        threads = await _fetch_page(client, forum_name, mid)
+        if threads:
+            best = mid
+            lo = mid + 1
+        else:
+            hi = mid - 1
+        await asyncio.sleep(0.3)
+    return best
+
+
 async def collect_forum_tids(bduss: str, forum_name: str) -> list[dict]:
-    """Paginate through a forum to collect all thread IDs."""
+    """Paginate from the oldest page to the newest, tolerating empty gaps."""
     log(f"Collecting all threads from [{forum_name}吧] ...")
     all_items = []
     seen_tids = set()
 
+    MAX_EMPTY_STREAK = 50
+
     async with tb.Client(bduss) as client:
-        pn = 1
+        max_page = await _find_max_page(client, forum_name)
+        log(f"  Last page with content: {max_page}")
+
         empty_streak = 0
-        while True:
-            try:
-                threads = await client.get_threads(forum_name, pn=pn)
-            except Exception as e:
-                if "429" in str(e):
-                    log(f"  [429] Rate limited, waiting 30s ...")
-                    await asyncio.sleep(30)
-                    continue
-                log(f"  [ERROR] Page {pn} failed: {e}")
-                break
+        pn = max_page
+        while pn >= 1:
+            threads = await _fetch_page(client, forum_name, pn)
+
+            if threads is None:
+                empty_streak += 1
+                if empty_streak >= MAX_EMPTY_STREAK:
+                    log(f"  {MAX_EMPTY_STREAK} consecutive failures at page {pn}, stopping")
+                    break
+                pn -= 1
+                continue
 
             new_count = 0
             for t in threads:
@@ -101,16 +146,15 @@ async def collect_forum_tids(bduss: str, forum_name: str) -> list[dict]:
 
             if new_count == 0:
                 empty_streak += 1
-                if empty_streak >= 3:
-                    break
             else:
                 empty_streak = 0
 
-            if pn % 50 == 0:
-                log(f"  Page {pn}, collected {len(all_items)} threads so far ...")
+            if pn % 50 == 0 or pn == max_page:
+                log(f"  Page {pn}/{max_page}, collected {len(all_items)} threads so far ...")
 
-            pn += 1
+            pn -= 1
 
+    all_items.sort(key=lambda x: x["create_time"])
     log(f"  Collection complete: {len(all_items)} threads")
     return all_items
 
@@ -156,14 +200,20 @@ async def main_async(forum_name: str, output_dir: str, concurrency: int = 10):
         release_lock(lock_file)
 
 
+def _default_output_dir(forum_name: str) -> str:
+    """Generate default output dir: Ba_<forum_name>_<YYMMDD>."""
+    return f"Ba_{forum_name}_{time.strftime('%y%m%d')}"
+
+
 def main():
     parser = argparse.ArgumentParser(description="Back up all threads from a Tieba forum")
     parser.add_argument("forum", help="Forum name (without the trailing '吧')")
-    parser.add_argument("output_dir", help="Output directory")
+    parser.add_argument("output_dir", nargs="?", default=None, help="Output directory (default: Ba_<forum>_<YYMMDD>)")
     parser.add_argument("--concurrency", type=int, default=10, help="Max concurrency (default 10, adaptive throttling)")
     args = parser.parse_args()
 
-    asyncio.run(main_async(args.forum, args.output_dir, args.concurrency))
+    output_dir = args.output_dir or _default_output_dir(args.forum)
+    asyncio.run(main_async(args.forum, output_dir, args.concurrency))
 
 
 if __name__ == "__main__":

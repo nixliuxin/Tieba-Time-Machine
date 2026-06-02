@@ -176,6 +176,7 @@ def main():
     parser = argparse.ArgumentParser(description="Pack per-forum media files into uncompressed tar archives")
     parser.add_argument("--source", required=True, help="Source data directory (e.g. ./scraped_data)")
     parser.add_argument("--output", required=True, help="Output directory (e.g. ./archives)")
+    parser.add_argument("--forum", default=None, help="Only process the specified forum (directory name)")
     args = parser.parse_args()
 
     source_dir = args.source
@@ -190,7 +191,8 @@ def main():
     for name in os.listdir(source_dir):
         full = os.path.join(source_dir, name)
         if os.path.isdir(full) and not name.startswith("_"):
-            forum_dirs.append((name, full))
+            if args.forum is None or name == args.forum:
+                forum_dirs.append((name, full))
 
     print(f"Found {len(forum_dirs)} forum directories")
 

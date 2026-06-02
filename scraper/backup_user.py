@@ -107,10 +107,29 @@ async def collect_user_tids(bduss: str, uid: int, portrait: str) -> dict:
         }
 
 
+def _save_user_meta(output_dir: str, uid: int | None, portrait: str | None):
+    """Write _meta.json for user backups (preserves existing fields)."""
+    meta_path = os.path.join(output_dir, "_meta.json")
+    existing = {}
+    if os.path.exists(meta_path):
+        with open(meta_path, "r", encoding="utf-8") as f:
+            existing = json.load(f)
+    existing.setdefault("type", "user")
+    if uid:
+        existing.setdefault("uid", uid)
+    if portrait:
+        existing.setdefault("portrait", portrait)
+    existing.setdefault("created_at", time.strftime("%Y-%m-%d %H:%M:%S"))
+    with open(meta_path, "w", encoding="utf-8") as f:
+        json.dump(existing, f, ensure_ascii=False, indent=2)
+
+
 async def main_async(args):
     output_dir = args.output_dir
     os.makedirs(output_dir, exist_ok=True)
     setup_logging(output_dir, prefix="user")
+
+    _save_user_meta(output_dir, args.uid, args.portrait)
 
     bduss = read_bduss()
     init_archiver(output_dir, bduss=bduss)
@@ -136,14 +155,22 @@ async def main_async(args):
         release_lock(lock_file)
 
 
+def _default_output_dir(uid: int | None) -> str:
+    """Generate default output dir: User_<uid>_<YYMMDD>."""
+    tag = str(uid) if uid else "unknown"
+    return f"User_{tag}_{time.strftime('%y%m%d')}"
+
+
 def main():
     parser = argparse.ArgumentParser(description="Back up all content for a user across all forums")
-    parser.add_argument("output_dir", help="Output directory")
+    parser.add_argument("output_dir", nargs="?", default=None, help="Output directory (default: User_<uid>_<YYMMDD>)")
     parser.add_argument("--uid", type=int, help="User UID (required on first run to collect tids)")
     parser.add_argument("--portrait", help="User portrait (required on first run to collect tids)")
     parser.add_argument("--concurrency", type=int, default=10, help="Max concurrency (default 10, adaptive throttling)")
     args = parser.parse_args()
 
+    if args.output_dir is None:
+        args.output_dir = _default_output_dir(args.uid)
     asyncio.run(main_async(args))
 
 

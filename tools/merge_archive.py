@@ -270,18 +270,116 @@ def find_thread_dirs(forum_dir: str):
     return results
 
 
+def merge_stub_threads(conn: sqlite3.Connection, source_forum_dir: str, forum_name: str, merged_tids: set):
+    """Merge deleted/failed threads from _all_tids.json + _progress.json as stub records."""
+    tids_file = os.path.join(source_forum_dir, "_all_tids.json")
+    progress_file = os.path.join(source_forum_dir, "_progress.json")
+
+    if not os.path.exists(tids_file):
+        return 0, 0
+
+    with open(tids_file, "r", encoding="utf-8") as f:
+        all_items = json.load(f)
+    tid_meta = {}
+    for item in all_items:
+        if isinstance(item, dict) and "tid" in item:
+            tid_meta[item["tid"]] = item
+
+    deleted_tids = set()
+    failed_tids = set()
+    if os.path.exists(progress_file):
+        with open(progress_file, "r", encoding="utf-8") as f:
+            progress = json.load(f)
+        deleted_tids = set(progress.get("deleted", []))
+        failed_tids = set(int(k) for k in progress.get("failed_details", {}).keys())
+
+    stub_tids = (deleted_tids | failed_tids) - merged_tids
+    if not stub_tids:
+        return 0, 0
+
+    deleted_count = 0
+    failed_count = 0
+    for tid in stub_tids:
+        meta = tid_meta.get(tid, {})
+        scrape_status = 1 if tid in deleted_tids else 2
+        title = meta.get("title", f"[tid={tid}]")
+        create_time = meta.get("create_time", 0)
+        reply_num = meta.get("reply_num", 0)
+        author_user_id = meta.get("author_id", 0)
+
+        conn.execute(
+            """INSERT OR IGNORE INTO thread
+            (tid, title, forum_id, forum_name, author_user_id, reply_num, create_time, scrape_status)
+            VALUES (?, ?, 0, ?, ?, ?, ?, ?)""",
+            (tid, title, forum_name, author_user_id, reply_num, create_time, scrape_status),
+        )
+        conn.execute(
+            "INSERT OR IGNORE INTO merge_progress (tid, forum_name, merged_at) VALUES (?, ?, ?)",
+            (tid, forum_name, int(time.time())),
+        )
+
+        if tid in deleted_tids:
+            deleted_count += 1
+        else:
+            failed_count += 1
+
+    conn.commit()
+    return deleted_count, failed_count
+
+
+def _resolve_output_name(source_forum_dir: str, forum_dir_name: str) -> str:
+    """Generate standardized output dir name: Ba_<forum>_<YYMMDD> or User_<name>_<YYMMDD>.
+
+    Uses _meta.json for the scrape date. Falls back to source dir mtime if unavailable.
+    If the source dir already follows the convention, preserves it as-is.
+    """
+    import re as _re
+
+    if _re.match(r"^(Ba|User)_.+_\d{6}$", forum_dir_name):
+        return forum_dir_name
+
+    meta_path = os.path.join(source_forum_dir, "_meta.json")
+    date_str = None
+    backup_type = "Ba"
+
+    if os.path.exists(meta_path):
+        with open(meta_path, "r", encoding="utf-8") as f:
+            meta = json.load(f)
+        created = meta.get("created_at", "")
+        if created:
+            date_str = created[:10].replace("-", "")[2:]  # "2026-05-30" -> "260530"
+        if meta.get("type") == "user":
+            backup_type = "User"
+
+    if not date_str:
+        mtime = os.path.getmtime(source_forum_dir)
+        from datetime import datetime
+        date_str = datetime.fromtimestamp(mtime).strftime("%y%m%d")
+
+    return f"{backup_type}_{forum_dir_name}_{date_str}"
+
+
 def merge_one_forum(source_forum_dir: str, forum_dir_name: str, output_dir: str):
     """Merge all threads from a single forum into its own master.db."""
-    out_forum_dir = os.path.join(output_dir, forum_dir_name)
+    canonical_name = _resolve_output_name(source_forum_dir, forum_dir_name)
+    out_forum_dir = os.path.join(output_dir, canonical_name)
     os.makedirs(out_forum_dir, exist_ok=True)
     output_path = os.path.join(out_forum_dir, "master.db")
 
     print(f"\n{'='*50}")
-    print(f"  Forum: {forum_dir_name}")
+    print(f"  Forum: {forum_dir_name} -> {canonical_name}")
     print(f"  Output: {output_path}")
     print(f"{'='*50}")
 
     conn = init_master_db(output_path)
+
+    # Ensure scrape_status column exists (for DBs created before this change)
+    try:
+        conn.execute("SELECT scrape_status FROM thread LIMIT 0")
+    except sqlite3.OperationalError:
+        conn.execute("ALTER TABLE thread ADD COLUMN scrape_status INTEGER DEFAULT 0")
+        conn.commit()
+
     merged_tids = get_merged_tids(conn)
     print(f"  Already merged {len(merged_tids)} threads")
 
@@ -290,10 +388,6 @@ def merge_one_forum(source_forum_dir: str, forum_dir_name: str, output_dir: str)
 
     pending = [(p, fn, tid, name) for p, fn, tid, name in threads if tid not in merged_tids]
     print(f"  Pending: {len(pending)} threads")
-
-    if not pending:
-        conn.close()
-        return
 
     start_time = time.time()
     errors = 0
@@ -336,6 +430,17 @@ def merge_one_forum(source_forum_dir: str, forum_dir_name: str, output_dir: str)
             eta = (len(pending) - i - 1) / rate if rate > 0 else 0
             print(f"  [{i+1}/{len(pending)}] {rate:.1f} threads/s, ETA {eta:.0f}s", flush=True)
 
+    # Merge stub records for deleted/failed threads
+    merged_tids = get_merged_tids(conn)
+    forum_name_for_stubs = forum_dir_name
+    if threads:
+        forum_name_for_stubs = threads[0][1] or forum_dir_name
+    deleted_count, failed_count = merge_stub_threads(
+        conn, source_forum_dir, forum_name_for_stubs, merged_tids
+    )
+    if deleted_count or failed_count:
+        print(f"  Stub records: {deleted_count} deleted + {failed_count} failed threads")
+
     # Populate FTS index
     print("  Building FTS5 full-text index...")
     conn.execute("DELETE FROM post_fts")
@@ -346,13 +451,17 @@ def merge_one_forum(source_forum_dir: str, forum_dir_name: str, output_dir: str)
     conn.commit()
 
     # Summary stats
+    total_threads = conn.execute("SELECT COUNT(*) FROM thread").fetchone()[0]
+    full_threads = conn.execute("SELECT COUNT(*) FROM thread WHERE scrape_status = 0").fetchone()[0]
+    deleted_threads = conn.execute("SELECT COUNT(*) FROM thread WHERE scrape_status = 1").fetchone()[0]
+    failed_threads = conn.execute("SELECT COUNT(*) FROM thread WHERE scrape_status = 2").fetchone()[0]
     total_posts = conn.execute("SELECT COUNT(*) FROM post").fetchone()[0]
     total_users = conn.execute("SELECT COUNT(*) FROM user").fetchone()[0]
-    total_merged = conn.execute("SELECT COUNT(*) FROM merge_progress").fetchone()[0]
     db_size = os.path.getsize(output_path) / 1024 / 1024
-    print(f"  Done! {total_merged} threads, {total_posts} posts, {total_users} users | {db_size:.1f} MB")
+    print(f"  Done! {total_threads} threads ({full_threads} full, {deleted_threads} deleted, {failed_threads} failed)")
+    print(f"        {total_posts} posts, {total_users} users | {db_size:.1f} MB")
     if errors:
-        print(f"  ({errors} errors)")
+        print(f"  ({errors} merge errors)")
 
     conn.close()
 
