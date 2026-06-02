@@ -24,6 +24,7 @@ from config.path_config import ScrapeDataPathBuilder, sanitize_filename
 BACKOFF_INITIAL = 30
 BACKOFF_MAX = 300
 MAX_RETRIES_PER_TID = 3
+IDLE_TIMEOUT = 180  # seconds: cancel task if no file writes for 3 min
 
 
 # ── Logging (one file per session, captures all stdout/stderr) ──
@@ -164,6 +165,22 @@ def init_archiver(output_dir: str, bduss: str | None = None):
     log(f"[OK] Initialization complete, output dir: {output_dir}")
 
 
+async def verify_bduss():
+    """Quick BDUSS validity check — fetch a known forum. Exit if invalid."""
+    import aiotieba as tb
+    log("[CHECK] Verifying BDUSS ...")
+    try:
+        async with tb.Client(TiebaAuth.BDUSS) as client:
+            forum = await client.get_forum("贴吧")
+            if forum and forum.fid != 0:
+                log(f"[OK] BDUSS valid (test forum fid={forum.fid})")
+                return
+    except Exception as e:
+        log(f"[ERROR] BDUSS check failed: {e}")
+    log("[ERROR] BDUSS is invalid or expired. Please update tieba_auth.json")
+    sys.exit(1)
+
+
 # ── Integrity check ───────────────────────────────────────────
 def _load_done_tids(output_dir: str) -> set[int]:
     """Load confirmed-done tids from _done_tids.json (authoritative source)."""
@@ -182,10 +199,8 @@ def _save_done_tids(output_dir: str, done_set: set[int]):
 
 def scan_completed_tids(output_dir: str) -> set[int]:
     """
-    Determine which tids have been fully archived:
-    1. Use _done_tids.json as the authoritative record.
-    2. If that file doesn't exist (first migration), scan folders with valid content.db to generate it.
-    3. Subsequent runs: folders not in the done list are treated as incomplete and removed.
+    Fast path: load _done_tids.json as the authoritative record.
+    First-run migration (no _done_tids.json): scan folders to build the set.
     """
     done_file = os.path.join(output_dir, "_done_tids.json")
     done_set = _load_done_tids(output_dir)
@@ -193,52 +208,53 @@ def scan_completed_tids(output_dir: str) -> set[int]:
     if not os.path.exists(output_dir):
         return done_set
 
-    tid_re = re.compile(r"\[(\d+)\]")
-    migrating = not os.path.exists(done_file)
+    if os.path.exists(done_file):
+        log(f"[OK] Loaded {len(done_set)} confirmed done from _done_tids.json")
+        return done_set
 
+    # First-run migration: scan folders to build _done_tids.json
+    tid_re = re.compile(r"\[(\d+)\]")
+    log(f"[MIGRATE] No _done_tids.json — scanning folders to build it ...")
     all_dirs = [n for n in os.listdir(output_dir)
                 if os.path.isdir(os.path.join(output_dir, n)) and not n.startswith("_")]
     total_dirs = len(all_dirs)
-    if migrating and total_dirs > 0:
-        log(f"[MIGRATE] Scanning {total_dirs} folders ...")
 
-    removed_count = 0
     for idx, name in enumerate(all_dirs):
         full_path = os.path.join(output_dir, name)
         m = tid_re.search(name)
         if not m:
             continue
         tid = int(m.group(1))
-
-        if tid in done_set:
-            continue
-
-        if migrating:
-            db_path = os.path.join(full_path, "threads", str(tid), "content.db")
-            if os.path.exists(db_path):
-                try:
-                    conn = sqlite3.connect(db_path)
-                    count = conn.execute("SELECT COUNT(*) FROM post").fetchone()[0]
-                    conn.close()
-                    if count > 0:
-                        done_set.add(tid)
-                        continue
-                except Exception:
-                    pass
-            shutil.rmtree(full_path, ignore_errors=True)
-            removed_count += 1
-        else:
-            shutil.rmtree(full_path, ignore_errors=True)
-            removed_count += 1
-
-        if migrating and (idx + 1) % 500 == 0:
+        db_path = os.path.join(full_path, "threads", str(tid), "content.db")
+        if os.path.exists(db_path):
+            try:
+                conn = sqlite3.connect(db_path)
+                count = conn.execute("SELECT COUNT(*) FROM post").fetchone()[0]
+                conn.close()
+                if count > 0:
+                    done_set.add(tid)
+            except Exception:
+                pass
+        if (idx + 1) % 500 == 0:
             log(f"  ... checked {idx+1}/{total_dirs}, confirmed {len(done_set)} done")
 
-    if migrating and done_set:
-        _save_done_tids(output_dir, done_set)
-        log(f"[MIGRATE] Done: {len(done_set)} confirmed tids, removed {removed_count} incomplete")
+    _save_done_tids(output_dir, done_set)
+    log(f"[MIGRATE] Done: {len(done_set)} confirmed tids")
 
     return done_set
+
+
+def cleanup_incomplete_tid(output_dir: str, tid: int):
+    """Remove leftover folder for a single tid before re-scraping it."""
+    marker = f"[{tid}]"
+    try:
+        for name in os.listdir(output_dir):
+            if marker in name and os.path.isdir(os.path.join(output_dir, name)):
+                shutil.rmtree(os.path.join(output_dir, name), ignore_errors=True)
+                return True
+    except OSError:
+        pass
+    return False
 
 
 # ── Progress file ─────────────────────────────────────────────
@@ -292,6 +308,58 @@ def save_tids_cache(output_dir: str, all_tids: list[int], extra: dict | None = N
         payload.update(extra)
     with open(cache_file, "w", encoding="utf-8") as f:
         json.dump(payload, f, ensure_ascii=False, indent=2)
+
+
+# ── Idle-timeout watchdog ─────────────────────────────────────
+def _latest_mtime_for_tid(output_dir: str, tid: int) -> float:
+    """Return newest mtime of any file inside this tid's scrape folder, or 0."""
+    marker = f"[{tid}]"
+    try:
+        entries = os.listdir(output_dir)
+    except OSError:
+        return 0.0
+    for name in entries:
+        if marker not in name:
+            continue
+        tid_dir = os.path.join(output_dir, name)
+        if not os.path.isdir(tid_dir):
+            continue
+        best = 0.0
+        for root, _, files in os.walk(tid_dir):
+            for f in files:
+                try:
+                    mt = os.path.getmtime(os.path.join(root, f))
+                    if mt > best:
+                        best = mt
+                except OSError:
+                    pass
+        return best
+    return 0.0
+
+
+async def _scrape_with_watchdog(tid: int, output_dir: str):
+    """Run scrape(tid); cancel only if no file-system activity for IDLE_TIMEOUT seconds.
+    Large threads can run arbitrarily long as long as files keep being written."""
+    task = asyncio.create_task(scrape(tid))
+    last_activity = time.time()
+
+    while not task.done():
+        done, _ = await asyncio.wait({task}, timeout=20)
+        if done:
+            break
+
+        mt = _latest_mtime_for_tid(output_dir, tid)
+        if mt > last_activity:
+            last_activity = mt
+        elif time.time() - last_activity > IDLE_TIMEOUT:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            raise asyncio.TimeoutError(f"no file activity for {IDLE_TIMEOUT}s")
+
+    return task.result()
 
 
 # ── Batch download main loop (concurrent + adaptive throttling) ──
@@ -391,11 +459,12 @@ async def batch_download(all_tids: list[int], output_dir: str, max_concurrency: 
         async with semaphore:
             await global_paused.wait()
 
+            cleanup_incomplete_tid(output_dir, tid)
             retries = 0
             backoff = BACKOFF_INITIAL
             while retries < MAX_RETRIES_PER_TID:
                 try:
-                    await scrape(tid)
+                    await _scrape_with_watchdog(tid, output_dir)
                     if not _verify_scrape(tid):
                         raise RuntimeError(f"scrape() returned but produced no valid data (tid={tid})")
                     async with progress_lock:
@@ -403,6 +472,13 @@ async def batch_download(all_tids: list[int], output_dir: str, max_concurrency: 
                         _save_done_tids(output_dir, completed_set)
                         success_count += 1
                         failed_dict.pop(tid, None)
+                    break
+                except asyncio.TimeoutError as te:
+                    elapsed = int(time.time() - start_time)
+                    log(f"  [IDLE TIMEOUT] tid={tid}: {te} (wall {elapsed}s), skipping")
+                    async with progress_lock:
+                        fail_count += 1
+                        failed_dict[tid] = str(te)
                     break
                 except Exception as e:
                     err = str(e)

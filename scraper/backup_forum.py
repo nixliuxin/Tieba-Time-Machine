@@ -30,6 +30,7 @@ from backup_lib import (
     release_lock,
     batch_download,
     read_bduss,
+    verify_bduss,
     log,
 )
 
@@ -172,6 +173,7 @@ async def main_async(forum_name: str, output_dir: str, concurrency: int = 10):
 
     bduss = read_bduss()
     init_archiver(output_dir, bduss=bduss)
+    await verify_bduss()
     log(f"[OK] Target: {forum_name}吧 → {output_dir}")
 
     tids = load_tids(output_dir)
