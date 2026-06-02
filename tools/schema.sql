@@ -17,6 +17,7 @@ CREATE TABLE IF NOT EXISTS forum (
 );
 
 -- 帖子(主题)元信息
+-- scrape_status: 0=完整抓取, 1=已被百度删除(仅有列表元数据), 2=抓取失败
 CREATE TABLE IF NOT EXISTS thread (
     tid             INTEGER PRIMARY KEY,
     title           TEXT NOT NULL,
@@ -36,7 +37,8 @@ CREATE TABLE IF NOT EXISTS thread (
     disagree        INTEGER DEFAULT 0,
     create_time     INTEGER DEFAULT 0,
     status          INTEGER DEFAULT 0,
-    folder_name     TEXT DEFAULT ''
+    folder_name     TEXT DEFAULT '',
+    scrape_status   INTEGER DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_thread_forum ON thread(forum_name);
 CREATE INDEX IF NOT EXISTS idx_thread_create_time ON thread(create_time);
