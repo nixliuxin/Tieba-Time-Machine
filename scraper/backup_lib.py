@@ -130,7 +130,10 @@ def read_bduss() -> str:
 
 # ── Monkey-patch: idempotent folder names (no timestamp) ─────
 def _make_idempotent_builder(cls, forum_name: str, tid: int, title: str):
-    safe_title = sanitize_filename(title)[:80]
+    safe_title = re.sub(r'[\x00-\x1f\x7f]', '', title)
+    safe_title = sanitize_filename(safe_title)[:80]
+    if not safe_title:
+        safe_title = "untitled"
     folder_name = f"[{forum_name}吧][{tid}]{safe_title}"
     item_dir = os.path.join(cls.DATA_FOLDER_NAME, folder_name)
     os.makedirs(item_dir, exist_ok=True)
@@ -372,11 +375,14 @@ async def batch_download(all_tids: list[int], output_dir: str, max_concurrency: 
     deleted_set, failed_dict = load_progress_sets(output_dir)
     skip_set = completed_set | deleted_set
 
-    remaining = [tid for tid in all_tids if tid not in skip_set]
+    failed_set = set(failed_dict.keys())
+    fresh = [tid for tid in all_tids if tid not in skip_set and tid not in failed_set]
+    retries = [tid for tid in all_tids if tid in failed_set and tid not in skip_set]
+    remaining = fresh + retries
     total = len(all_tids)
 
     log(f"{'='*60}")
-    log(f"Total: {total} | Done: {len(completed_set)} | Deleted: {len(deleted_set)} | Failed: {len(failed_dict)} | Pending: {len(remaining)}")
+    log(f"Total: {total} | Done: {len(completed_set)} | Deleted: {len(deleted_set)} | Failed(retry): {len(retries)} | Fresh: {len(fresh)}")
     log(f"Concurrency: {max_concurrency} | Output: {output_dir}")
     log(f"{'='*60}")
 
@@ -482,7 +488,7 @@ async def batch_download(all_tids: list[int], output_dir: str, max_concurrency: 
                     break
                 except Exception as e:
                     err = str(e)
-                    if "429" in err or "Too Many Requests" in err or "no valid data" in err:
+                    if "429" in err or "Too Many Requests" in err:
                         retries += 1
                         await handle_429(backoff)
                         backoff = min(backoff * 2, BACKOFF_MAX)
@@ -490,6 +496,11 @@ async def batch_download(all_tids: list[int], output_dir: str, max_concurrency: 
                         async with progress_lock:
                             deleted_set.add(tid)
                         log(f"  [DELETED] tid={tid}")
+                        break
+                    elif "no valid data" in err:
+                        async with progress_lock:
+                            deleted_set.add(tid)
+                        log(f"  [EMPTY] tid={tid}: scrape returned no data (likely deleted)")
                         break
                     else:
                         async with progress_lock:
