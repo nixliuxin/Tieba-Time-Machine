@@ -69,11 +69,18 @@ def _load_forum_from_dir(forum_dir: str, name: str, collection: str = None):
     if not os.path.exists(db_path):
         return False
     media_index = {}
-    idx_path = os.path.join(forum_dir, "media_index.json")
-    if os.path.exists(idx_path):
-        with open(idx_path, "r", encoding="utf-8") as f:
-            media_index = json.load(f)
-    tar_path = os.path.join(forum_dir, "media.tar")
+    for idx_name in ("data_index.json", "media_index.json"):
+        idx_path = os.path.join(forum_dir, idx_name)
+        if os.path.exists(idx_path):
+            with open(idx_path, "r", encoding="utf-8") as f:
+                media_index = json.load(f)
+            break
+    tar_path = None
+    for tar_name in ("data.tar", "media.tar"):
+        candidate = os.path.join(forum_dir, tar_name)
+        if os.path.exists(candidate):
+            tar_path = candidate
+            break
 
     key = f"{collection}/{name}" if collection else name
     if key in _forums:
@@ -82,7 +89,7 @@ def _load_forum_from_dir(forum_dir: str, name: str, collection: str = None):
     _forums[key] = {
         "db_path": db_path,
         "media_index": media_index,
-        "tar_path": tar_path if os.path.exists(tar_path) else None,
+        "tar_path": tar_path,
         "source_path": os.path.dirname(forum_dir),
         "collection": collection,
         "display_name": name,

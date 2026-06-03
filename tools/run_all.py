@@ -6,7 +6,7 @@ Usage:
 
 Steps:
   1. Merge content.db + json -> per-forum master.db
-  2. Pack media -> per-forum .tar + media_index.json
+  2. Pack assets -> per-forum data.tar + data_index.json
   3. Generate PAR2 parity files (if par2 is available)
 """
 
