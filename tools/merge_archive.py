@@ -1,9 +1,10 @@
 r"""
-merge_archive.py - Merge all per-thread content.db + JSON into unified master.db.
+merge_archive.py - Merge all per-thread data + assets into a single archive folder.
 
 Usage:
     python merge_archive.py --source ./scraped_data --output ./archives
 
+Produces per-forum: master.db (all structured data) + data.tar + data_index.json (media + logs).
 Supports resume: processed tids are tracked in master.db merge_progress table.
 """
 
@@ -12,6 +13,7 @@ import json
 import os
 import re
 import sqlite3
+import tarfile
 import time
 from pathlib import Path
 
@@ -19,6 +21,9 @@ from pathlib import Path
 FOLDER_PATTERN = re.compile(r"^\[(.+?)吧\]\[(\d+)\](.*)$")
 
 SCHEMA_PATH = Path(__file__).parent / "schema.sql"
+
+DB_MERGED_FILES = {"thread.json", "forum.json", "content.db", "scrape_info.json",
+                    "content.db-wal", "content.db-shm"}
 
 
 def parse_folder_name(name: str):
@@ -29,12 +34,17 @@ def parse_folder_name(name: str):
     return None, None, None
 
 
-def init_master_db(db_path: str) -> sqlite3.Connection:
+def init_master_db(db_path: str, *, bulk_import: bool = False) -> sqlite3.Connection:
     """Create or open master.db and initialize the schema."""
     conn = sqlite3.connect(db_path)
     conn.execute("PRAGMA journal_mode = WAL")
-    conn.execute("PRAGMA synchronous = NORMAL")
-    conn.execute("PRAGMA cache_size = -64000")  # 64MB cache
+    if bulk_import:
+        conn.execute("PRAGMA synchronous = OFF")
+        conn.execute("PRAGMA cache_size = -256000")  # 256MB cache
+        conn.execute("PRAGMA temp_store = MEMORY")
+    else:
+        conn.execute("PRAGMA synchronous = NORMAL")
+        conn.execute("PRAGMA cache_size = -64000")
     conn.execute("PRAGMA foreign_keys = ON")
 
     schema_sql = SCHEMA_PATH.read_text(encoding="utf-8")
@@ -131,106 +141,69 @@ def merge_forum_json(conn: sqlite3.Connection, forum_json_path: str, forum_name:
 
 
 def merge_content_db(conn: sqlite3.Connection, content_db_path: str, tid: int):
-    """Open content.db, read its data, and insert into master.db."""
+    """Merge content.db into master.db via ATTACH + cross-db INSERT...SELECT.
+
+    Far faster than row-by-row Python transfer: SQLite copies internally.
+    The per-thread `tid` is injected as a literal since content.db tables lack it.
+    """
     if not os.path.exists(content_db_path):
         return
 
-    src = sqlite3.connect(content_db_path)
-    src.execute("PRAGMA journal_mode = WAL")
-    src.execute("PRAGMA query_only = ON")
-
+    conn.execute("ATTACH DATABASE ? AS src", (content_db_path,))
     try:
-        tables = {r[0] for r in src.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+        tables = {r[0] for r in conn.execute("SELECT name FROM src.sqlite_master WHERE type='table'").fetchall()}
 
         # posts
         if "post" in tables:
-            # Check if scrape_batch_id column exists
-            cols = {r[1] for r in src.execute("PRAGMA table_info(post)").fetchall()}
-            has_batch = "scrape_batch_id" in cols
-
-            rows = src.execute(
-                f"SELECT id, contents, floor, user_id, agree, disagree, create_time, is_thread_author, sign, reply_num, parent_id, reply_to_id{', scrape_batch_id' if has_batch else ''} FROM post"
-            ).fetchall()
-            for r in rows:
-                batch_id = r[12] if has_batch and len(r) > 12 else 0
-                conn.execute(
-                    """INSERT OR IGNORE INTO post (id, tid, contents, floor, user_id, agree, disagree,
+            cols = {r[1] for r in conn.execute("PRAGMA src.table_info(post)").fetchall()}
+            batch_sel = "scrape_batch_id" if "scrape_batch_id" in cols else "0"
+            conn.execute(
+                f"""INSERT OR IGNORE INTO post (id, tid, contents, floor, user_id, agree, disagree,
                        create_time, is_thread_author, sign, reply_num, parent_id, reply_to_id, scrape_batch_id)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                    (r[0], tid, r[1], r[2], r[3], r[4], r[5], r[6], r[7], r[8], r[9], r[10], r[11], batch_id),
-                )
+                    SELECT id, {tid}, contents, floor, user_id, agree, disagree,
+                       create_time, is_thread_author, sign, reply_num, parent_id, reply_to_id, {batch_sel}
+                    FROM src.post"""
+            )
 
         # users
         if "user" in tables:
-            cols = {r[1] for r in src.execute("PRAGMA table_info(user)").fetchall()}
-            has_id = "id" in cols
-            has_completed = "completed" in cols
-            has_scrape_time = "scrape_time" in cols
-
-            select_cols = "portrait, username, nickname, tieba_uid, avatar, glevel, gender, ip, is_vip, is_god, age, sign, post_num, agree_num, fan_num, follow_num, forum_num, level, is_bawu, status"
-            if has_completed:
-                select_cols += ", completed"
-            if has_scrape_time:
-                select_cols += ", scrape_time"
-            if has_id:
-                select_cols += ", id"
-
-            rows = src.execute(f"SELECT {select_cols} FROM user WHERE portrait IS NOT NULL").fetchall()
-            for r in rows:
-                base_len = 20
-                idx = base_len
-                completed = 0
-                scrape_time = 0
-                user_id_val = 0
-
-                if has_completed:
-                    completed = r[idx] if len(r) > idx else 0
-                    idx += 1
-                if has_scrape_time:
-                    scrape_time = r[idx] if len(r) > idx else 0
-                    idx += 1
-                if has_id:
-                    user_id_val = r[idx] if len(r) > idx else 0
-                    idx += 1
-
-                conn.execute(
-                    """INSERT OR IGNORE INTO user (portrait, tid, user_id, username, nickname, tieba_uid, avatar,
+            cols = {r[1] for r in conn.execute("PRAGMA src.table_info(user)").fetchall()}
+            id_sel = "id" if "id" in cols else "0"
+            completed_sel = "completed" if "completed" in cols else "0"
+            scrape_time_sel = "scrape_time" if "scrape_time" in cols else "0"
+            conn.execute(
+                f"""INSERT OR IGNORE INTO user (portrait, tid, user_id, username, nickname, tieba_uid, avatar,
                        glevel, gender, ip, is_vip, is_god, age, sign, post_num, agree_num,
                        fan_num, follow_num, forum_num, level, is_bawu, status, completed, scrape_time)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                    (r[0], tid, user_id_val, r[1], r[2], r[3], r[4], r[5], r[6], r[7], r[8], r[9], r[10], r[11],
-                     r[12], r[13], r[14], r[15], r[16], r[17], r[18], r[19], completed, scrape_time),
-                )
+                    SELECT portrait, {tid}, {id_sel}, username, nickname, tieba_uid, avatar,
+                       glevel, gender, ip, is_vip, is_god, age, sign, post_num, agree_num,
+                       fan_num, follow_num, forum_num, level, is_bawu, status, {completed_sel}, {scrape_time_sel}
+                    FROM src.user WHERE portrait IS NOT NULL"""
+            )
 
         # tieba_origin_src
         if "tieba_origin_src" in tables:
-            rows = src.execute("SELECT id, filename, content_frag_type, origin_src FROM tieba_origin_src").fetchall()
-            for r in rows:
-                conn.execute(
-                    "INSERT OR IGNORE INTO tieba_origin_src (id, tid, filename, content_frag_type, origin_src) VALUES (?, ?, ?, ?, ?)",
-                    (r[0], tid, r[1], r[2], r[3]),
-                )
+            conn.execute(
+                f"""INSERT OR IGNORE INTO tieba_origin_src (id, tid, filename, content_frag_type, origin_src)
+                    SELECT id, {tid}, filename, content_frag_type, origin_src FROM src.tieba_origin_src"""
+            )
 
         # scrape_batch
         if "scrape_batch" in tables:
-            rows = src.execute("SELECT id, scraper_version, scrape_config, scrape_time FROM scrape_batch").fetchall()
-            for r in rows:
-                conn.execute(
-                    "INSERT OR IGNORE INTO scrape_batch (id, tid, scraper_version, scrape_config, scrape_time) VALUES (?, ?, ?, ?, ?)",
-                    (r[0], tid, r[1], r[2], r[3]),
-                )
+            conn.execute(
+                f"""INSERT OR IGNORE INTO scrape_batch (id, tid, scraper_version, scrape_config, scrape_time)
+                    SELECT id, {tid}, scraper_version, scrape_config, scrape_time FROM src.scrape_batch"""
+            )
 
         # user_info_history
         if "user_info_history" in tables:
-            rows = src.execute("SELECT portrait, username, tieba_uid, field_name, field_value, scrape_time FROM user_info_history").fetchall()
-            for r in rows:
-                conn.execute(
-                    "INSERT INTO user_info_history (tid, portrait, username, tieba_uid, field_name, field_value, scrape_time) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                    (tid, r[0], r[1], r[2], r[3], r[4], r[5]),
-                )
+            conn.execute(
+                f"""INSERT INTO user_info_history (tid, portrait, username, tieba_uid, field_name, field_value, scrape_time)
+                    SELECT {tid}, portrait, username, tieba_uid, field_name, field_value, scrape_time FROM src.user_info_history"""
+            )
 
     finally:
-        src.close()
+        conn.execute("DETACH DATABASE src")
 
 
 def merge_scrape_info(conn: sqlite3.Connection, scrape_info_path: str, tid: int):
@@ -257,8 +230,10 @@ def merge_scrape_info(conn: sqlite3.Connection, scrape_info_path: str, tid: int)
 
 def find_thread_dirs(forum_dir: str):
     """Scan a forum directory and find all thread folders."""
+    print(f"  Scanning thread folders ...", flush=True)
     results = []
-    for name in os.listdir(forum_dir):
+    all_entries = os.listdir(forum_dir)
+    for i, name in enumerate(all_entries):
         if name.startswith("_"):
             continue
         full = os.path.join(forum_dir, name)
@@ -267,6 +242,8 @@ def find_thread_dirs(forum_dir: str):
         forum_name, tid, title = parse_folder_name(name)
         if tid is not None:
             results.append((full, forum_name, tid, name))
+        if (i + 1) % 5000 == 0:
+            print(f"    ... listed {i+1}/{len(all_entries)}, found {len(results)} threads", flush=True)
     return results
 
 
@@ -359,6 +336,49 @@ def _resolve_output_name(source_forum_dir: str, forum_dir_name: str) -> str:
     return f"{backup_type}_{forum_dir_name}_{date_str}"
 
 
+def build_fts_index(conn: sqlite3.Connection, total_posts: int, *, force: bool = False):
+    """Rebuild the FTS5 index in batches with progress, avoiding a giant single transaction.
+
+    Idempotent: skips rebuild if the index already covers all posts (unless force=True).
+    """
+    if not force:
+        try:
+            fts_count = conn.execute("SELECT COUNT(*) FROM post_fts").fetchone()[0]
+            if fts_count == total_posts and total_posts > 0:
+                print(f"  FTS index already up-to-date ({fts_count} posts), skipping", flush=True)
+                return
+        except sqlite3.OperationalError:
+            pass
+
+    print(f"  Building FTS5 full-text index ({total_posts} posts) ...", flush=True)
+    fts_start = time.time()
+
+    conn.execute("DROP TABLE IF EXISTS post_fts")
+    conn.commit()
+    conn.execute(
+        "CREATE VIRTUAL TABLE post_fts USING fts5(tid UNINDEXED, post_id UNINDEXED, floor UNINDEXED, contents)"
+    )
+    conn.commit()
+
+    BATCH = 50000
+    offset = 0
+    while offset < total_posts:
+        conn.execute(
+            "INSERT INTO post_fts(tid, post_id, floor, contents) "
+            "SELECT tid, id, floor, contents FROM post LIMIT ? OFFSET ?",
+            (BATCH, offset),
+        )
+        conn.commit()
+        offset += BATCH
+        done = min(offset, total_posts)
+        elapsed = time.time() - fts_start
+        rate = done / elapsed if elapsed > 0 else 0
+        eta = (total_posts - done) / rate if rate > 0 else 0
+        print(f"    FTS [{done}/{total_posts}] {done*100//max(total_posts,1)}% {rate:.0f} rows/s ETA {eta:.0f}s", flush=True)
+
+    print(f"  FTS index built in {time.time() - fts_start:.0f}s", flush=True)
+
+
 def merge_one_forum(source_forum_dir: str, forum_dir_name: str, output_dir: str):
     """Merge all threads from a single forum into its own master.db."""
     canonical_name = _resolve_output_name(source_forum_dir, forum_dir_name)
@@ -371,7 +391,7 @@ def merge_one_forum(source_forum_dir: str, forum_dir_name: str, output_dir: str)
     print(f"  Output: {output_path}")
     print(f"{'='*50}")
 
-    conn = init_master_db(output_path)
+    conn = init_master_db(output_path, bulk_import=True)
 
     # Ensure scrape_status column exists (for DBs created before this change)
     try:
@@ -386,49 +406,102 @@ def merge_one_forum(source_forum_dir: str, forum_dir_name: str, output_dir: str)
     threads = find_thread_dirs(source_forum_dir)
     print(f"  Found {len(threads)} thread folders")
 
-    pending = [(p, fn, tid, name) for p, fn, tid, name in threads if tid not in merged_tids]
-    print(f"  Pending: {len(pending)} threads")
+    # ── Open data.tar + load asset index for single-pass packing ──
+    index_path = os.path.join(out_forum_dir, "data_index.json")
+    index_data = {"tar_file": "data.tar", "files": {}}
+    if os.path.exists(index_path):
+        with open(index_path, "r", encoding="utf-8") as f:
+            index_data = json.load(f)
+            index_data.setdefault("tar_file", "data.tar")
+            index_data.setdefault("files", {})
+    packed_tids = set()
+    for p in index_data["files"]:
+        tid_str = p.split("/")[0]
+        if tid_str.isdigit():
+            packed_tids.add(int(tid_str))
+
+    def flush_index():
+        tmp = index_path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(index_data, f, ensure_ascii=False)
+        os.replace(tmp, index_path)
+
+    tar_full = os.path.join(out_forum_dir, "data.tar")
+    tar_mode = "a" if os.path.exists(tar_full) else "w"
+    tf = tarfile.open(tar_full, f"{tar_mode}:")
+
+    # A thread needs work if it isn't fully merged OR isn't packed yet.
+    pending = [(p, fn, tid, name) for p, fn, tid, name in threads
+               if tid not in merged_tids or tid not in packed_tids]
+    print(f"  Pending: {len(pending)} threads (merge + asset pack, single pass)")
 
     start_time = time.time()
     errors = 0
-    for i, (folder_path, forum_name, tid, folder_name) in enumerate(pending):
-        thread_dir = os.path.join(folder_path, "threads", str(tid))
-        if not os.path.isdir(thread_dir):
-            thread_dir = folder_path
+    total_files = 0
 
-        thread_json = os.path.join(thread_dir, "thread.json")
-        forum_json = os.path.join(thread_dir, "forum.json")
-        content_db = os.path.join(thread_dir, "content.db")
-        scrape_info_file = os.path.join(folder_path, "scrape_info.json")
-        if not os.path.exists(scrape_info_file):
-            scrape_info_file = os.path.join(thread_dir, "scrape_info.json")
+    try:
+        for i, (folder_path, forum_name, tid, folder_name) in enumerate(pending):
+            thread_dir = os.path.join(folder_path, "threads", str(tid))
+            if not os.path.isdir(thread_dir):
+                thread_dir = folder_path
 
-        conn.execute("BEGIN")
-        try:
-            merge_forum_json(conn, forum_json, forum_name)
-            merge_thread_json(conn, thread_json, tid, forum_name, folder_name)
-            merge_content_db(conn, content_db, tid)
-            merge_scrape_info(conn, scrape_info_file, tid)
+            try:
+                # 1. Merge structured data (skip if already merged)
+                if tid not in merged_tids:
+                    thread_json = os.path.join(thread_dir, "thread.json")
+                    forum_json = os.path.join(thread_dir, "forum.json")
+                    content_db = os.path.join(thread_dir, "content.db")
+                    scrape_info_file = os.path.join(folder_path, "scrape_info.json")
+                    if not os.path.exists(scrape_info_file):
+                        scrape_info_file = os.path.join(thread_dir, "scrape_info.json")
 
-            conn.execute(
-                "INSERT OR IGNORE INTO merge_progress (tid, forum_name, merged_at) VALUES (?, ?, ?)",
-                (tid, forum_name, int(time.time())),
-            )
-            conn.commit()
-        except Exception as e:
-            conn.rollback()
-            errors += 1
-            if errors <= 5:
-                print(f"  [ERROR] tid={tid}: {e}")
-            elif errors == 6:
-                print(f"  ... additional errors suppressed")
-            continue
+                    merge_forum_json(conn, forum_json, forum_name)
+                    merge_thread_json(conn, thread_json, tid, forum_name, folder_name)
+                    merge_content_db(conn, content_db, tid)
+                    merge_scrape_info(conn, scrape_info_file, tid)
+                    conn.execute(
+                        "INSERT OR IGNORE INTO merge_progress (tid, forum_name, merged_at) VALUES (?, ?, ?)",
+                        (tid, forum_name, int(time.time())),
+                    )
 
-        if (i + 1) % 100 == 0 or (i + 1) == len(pending):
-            elapsed = time.time() - start_time
-            rate = (i + 1) / elapsed if elapsed > 0 else 0
-            eta = (len(pending) - i - 1) / rate if rate > 0 else 0
-            print(f"  [{i+1}/{len(pending)}] {rate:.1f} threads/s, ETA {eta:.0f}s", flush=True)
+                # 2. Pack assets in the same pass (skip if already packed)
+                if tid not in packed_tids:
+                    for disk_path, internal_path in _collect_asset_files(folder_path, tid):
+                        if internal_path in index_data["files"]:
+                            continue
+                        try:
+                            info = tf.gettarinfo(disk_path, arcname=internal_path)
+                            offset = tf.offset
+                            with open(disk_path, "rb") as fh:
+                                tf.addfile(info, fh)
+                            index_data["files"][internal_path] = {"offset": offset, "size": info.size}
+                            total_files += 1
+                        except (PermissionError, OSError):
+                            pass
+            except Exception as e:
+                errors += 1
+                if errors <= 5:
+                    print(f"  [ERROR] tid={tid}: {e}")
+                elif errors == 6:
+                    print(f"  ... additional errors suppressed")
+                continue
+
+            if (i + 1) % 500 == 0 or (i + 1) == len(pending):
+                elapsed = time.time() - start_time
+                rate = (i + 1) / elapsed if elapsed > 0 else 0
+                eta = (len(pending) - i - 1) / rate if rate > 0 else 0
+                print(f"  [{i+1}/{len(pending)}] {rate:.1f} threads/s, {total_files} assets, ETA {eta:.0f}s", flush=True)
+                # Periodically persist progress so an interruption never loses work.
+                conn.commit()
+                tf.fileobj.flush()
+                flush_index()
+    finally:
+        tf.close()
+
+    conn.commit()
+
+    # Persist asset index
+    flush_index()
 
     # Merge stub records for deleted/failed threads
     merged_tids = get_merged_tids(conn)
@@ -441,29 +514,49 @@ def merge_one_forum(source_forum_dir: str, forum_dir_name: str, output_dir: str)
     if deleted_count or failed_count:
         print(f"  Stub records: {deleted_count} deleted + {failed_count} failed threads")
 
-    # Populate FTS index
-    print("  Building FTS5 full-text index...")
-    conn.execute("DELETE FROM post_fts")
-    conn.execute(
-        "INSERT INTO post_fts(tid, post_id, floor, contents) "
-        "SELECT tid, id, floor, contents FROM post"
-    )
-    conn.commit()
+    # Build FTS index (batched, with progress)
+    total_posts = conn.execute("SELECT COUNT(*) FROM post").fetchone()[0]
+    build_fts_index(conn, total_posts)
 
     # Summary stats
+    print("  Computing stats ...", flush=True)
     total_threads = conn.execute("SELECT COUNT(*) FROM thread").fetchone()[0]
     full_threads = conn.execute("SELECT COUNT(*) FROM thread WHERE scrape_status = 0").fetchone()[0]
     deleted_threads = conn.execute("SELECT COUNT(*) FROM thread WHERE scrape_status = 1").fetchone()[0]
     failed_threads = conn.execute("SELECT COUNT(*) FROM thread WHERE scrape_status = 2").fetchone()[0]
-    total_posts = conn.execute("SELECT COUNT(*) FROM post").fetchone()[0]
     total_users = conn.execute("SELECT COUNT(*) FROM user").fetchone()[0]
     db_size = os.path.getsize(output_path) / 1024 / 1024
+    tar_size = os.path.getsize(tar_full) / 1024 / 1024 if os.path.exists(tar_full) else 0
+    total_time = time.time() - start_time
     print(f"  Done! {total_threads} threads ({full_threads} full, {deleted_threads} deleted, {failed_threads} failed)")
-    print(f"        {total_posts} posts, {total_users} users | {db_size:.1f} MB")
+    print(f"        {total_posts} posts, {total_users} users, {total_files} new assets")
+    print(f"        master.db={db_size:.1f}MB, data.tar={tar_size:.1f}MB | {total_time:.0f}s total")
     if errors:
         print(f"  ({errors} merge errors)")
 
     conn.close()
+
+
+def _collect_asset_files(thread_folder: str, tid: int):
+    """Collect all files NOT already merged into master.db."""
+    results = []
+    thread_dir = os.path.join(thread_folder, "threads", str(tid))
+    if not os.path.isdir(thread_dir):
+        thread_dir = thread_folder
+
+    for root, _, files in os.walk(thread_dir):
+        rel_root = os.path.relpath(root, thread_dir)
+        for f in files:
+            if f in DB_MERGED_FILES:
+                continue
+            disk_path = os.path.join(root, f)
+            if rel_root == ".":
+                tar_path = f"{tid}/{f}"
+            else:
+                simplified = rel_root.replace("post_assets" + os.sep, "").replace("post_assets", "")
+                tar_path = f"{tid}/{simplified}/{f}" if simplified else f"{tid}/{f}"
+            results.append((disk_path, tar_path.replace("\\", "/")))
+    return results
 
 
 def remove_source_dir(source_forum_dir: str, forum_dir_name: str):
@@ -511,9 +604,14 @@ def main():
         sub = os.path.join(output_dir, name)
         if os.path.isdir(sub):
             db_file = os.path.join(sub, "master.db")
+            tar_file = os.path.join(sub, "data.tar")
+            parts = []
             if os.path.exists(db_file):
-                size = os.path.getsize(db_file) / 1024 / 1024
-                print(f"  {name}/master.db  ({size:.1f} MB)")
+                parts.append(f"db={os.path.getsize(db_file)/1024/1024:.1f}MB")
+            if os.path.exists(tar_file):
+                parts.append(f"data={os.path.getsize(tar_file)/1024/1024:.1f}MB")
+            if parts:
+                print(f"  {name}/  ({', '.join(parts)})")
 
 
 if __name__ == "__main__":

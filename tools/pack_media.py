@@ -1,13 +1,14 @@
 r"""
-pack_media.py - Pack per-forum media files into uncompressed tar with offset index.
+pack_media.py - Pack per-forum asset files into uncompressed tar with offset index.
 
 Usage:
     python pack_media.py --source ./scraped_data --output ./archives
 
 Features:
 - No compression (JPEG etc. are already compressed; tar preserves them as-is)
-- Generates media_index.json with offset/size for random access from reader
+- Generates data_index.json with offset/size for random access from reader
 - Incremental: already-packed tids are skipped on re-run
+- Packs media (images/video/audio) + scrape logs
 """
 
 import argparse
@@ -21,13 +22,8 @@ from pathlib import Path
 
 FOLDER_PATTERN = re.compile(r"^\[(.+?)吧\]\[(\d+)\](.*)$")
 
-MEDIA_EXTENSIONS = {
-    ".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp",
-    ".mp4", ".avi", ".flv", ".mkv", ".mov",
-    ".mp3", ".wav", ".m4a", ".ogg", ".aac",
-}
-
-MEDIA_DIRS = {"forum_avatar", "user_avatar", "images", "videos", "voices"}
+DB_MERGED_FILES = {"thread.json", "forum.json", "content.db", "scrape_info.json",
+                    "content.db-wal", "content.db-shm"}
 
 
 def parse_folder_name(name: str):
@@ -37,8 +33,8 @@ def parse_folder_name(name: str):
     return None, None, None
 
 
-def collect_media_files(thread_folder: str, tid: int):
-    """Collect all media files in a thread folder; return list of (disk_path, tar_internal_path)."""
+def collect_asset_files(thread_folder: str, tid: int):
+    """Collect all files NOT already merged into master.db."""
     results = []
     thread_dir = os.path.join(thread_folder, "threads", str(tid))
     if not os.path.isdir(thread_dir):
@@ -47,21 +43,19 @@ def collect_media_files(thread_folder: str, tid: int):
     for root, dirs, files in os.walk(thread_dir):
         rel_root = os.path.relpath(root, thread_dir)
         for f in files:
-            ext = os.path.splitext(f)[1].lower()
-            if ext in MEDIA_EXTENSIONS:
-                disk_path = os.path.join(root, f)
-                # tar internal path: <tid>/<relative_path>
-                if rel_root == ".":
-                    tar_path = f"{tid}/{f}"
+            if f in DB_MERGED_FILES:
+                continue
+            disk_path = os.path.join(root, f)
+            if rel_root == ".":
+                tar_path = f"{tid}/{f}"
+            else:
+                simplified = rel_root.replace("post_assets" + os.sep, "").replace("post_assets", "")
+                if simplified:
+                    tar_path = f"{tid}/{simplified}/{f}"
                 else:
-                    # Simplify path: strip the post_assets intermediate directory
-                    simplified = rel_root.replace("post_assets" + os.sep, "").replace("post_assets", "")
-                    if simplified:
-                        tar_path = f"{tid}/{simplified}/{f}"
-                    else:
-                        tar_path = f"{tid}/{f}"
-                tar_path = tar_path.replace("\\", "/")
-                results.append((disk_path, tar_path))
+                    tar_path = f"{tid}/{f}"
+            tar_path = tar_path.replace("\\", "/")
+            results.append((disk_path, tar_path))
 
     return results
 
@@ -97,7 +91,7 @@ def pack_forum(source_dir: str, forum_dir_name: str, forum_path: str, output_dir
     out_forum_dir = os.path.join(output_dir, forum_dir_name)
     os.makedirs(out_forum_dir, exist_ok=True)
 
-    index_path = os.path.join(out_forum_dir, "media_index.json")
+    index_path = os.path.join(out_forum_dir, "data_index.json")
     index_data = load_index(index_path)
 
     # Parse all thread folders
@@ -115,7 +109,7 @@ def pack_forum(source_dir: str, forum_dir_name: str, forum_path: str, output_dir
     if not threads:
         return
 
-    tar_filename = "media.tar"
+    tar_filename = "data.tar"
     tar_path = os.path.join(out_forum_dir, tar_filename)
 
     # Already-packed tids
@@ -142,7 +136,7 @@ def pack_forum(source_dir: str, forum_dir_name: str, forum_path: str, output_dir
 
     try:
         for i, (folder_path, fn, tid) in enumerate(pending):
-            media_files = collect_media_files(folder_path, tid)
+            media_files = collect_asset_files(folder_path, tid)
 
             for disk_path, internal_path in media_files:
                 try:
@@ -201,11 +195,11 @@ def main():
 
     print(f"\nAll done!")
     for name in sorted(os.listdir(output_dir)):
-        idx_file = os.path.join(output_dir, name, "media_index.json")
+        idx_file = os.path.join(output_dir, name, "data_index.json")
         if os.path.exists(idx_file):
             idx = load_index(idx_file)
             count = len(idx.get("files", {}))
-            print(f"  {name}: {count} media files indexed")
+            print(f"  {name}: {count} asset files indexed")
 
 
 if __name__ == "__main__":
