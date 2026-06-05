@@ -149,6 +149,10 @@ def merge_content_db(conn: sqlite3.Connection, content_db_path: str, tid: int):
     if not os.path.exists(content_db_path):
         return
 
+    # ATTACH/DETACH cannot run inside an active transaction. Python's sqlite3
+    # implicitly opens a transaction on the preceding INSERTs, so commit first
+    # to ensure both ATTACH (here) and DETACH (in finally) execute cleanly.
+    conn.commit()
     conn.execute("ATTACH DATABASE ? AS src", (content_db_path,))
     try:
         tables = {r[0] for r in conn.execute("SELECT name FROM src.sqlite_master WHERE type='table'").fetchall()}
@@ -201,9 +205,22 @@ def merge_content_db(conn: sqlite3.Connection, content_db_path: str, tid: int):
                 f"""INSERT INTO user_info_history (tid, portrait, username, tieba_uid, field_name, field_value, scrape_time)
                     SELECT {tid}, portrait, username, tieba_uid, field_name, field_value, scrape_time FROM src.user_info_history"""
             )
-
+        # Commit the inserts so `src` is no longer bound to an active transaction.
+        conn.commit()
+    except Exception:
+        # Roll back so the failed thread's partial writes don't block DETACH.
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        raise
     finally:
-        conn.execute("DETACH DATABASE src")
+        # Defensive DETACH: never let a single thread leave `src` attached and
+        # cascade "database src is already in use" into every later thread.
+        try:
+            conn.execute("DETACH DATABASE src")
+        except Exception:
+            pass
 
 
 def merge_scrape_info(conn: sqlite3.Connection, scrape_info_path: str, tid: int):
