@@ -3,7 +3,7 @@ import math
 
 from aiotieba.typing import Posts, Comments, Post
 
-from api.aiotieba_client import get_posts, get_comments
+from api.aiotieba_client import get_posts, get_comments, ThreadUnavailable, FetchIncomplete
 from config.scraper_config import SCRAPER_VERSION
 from container.container import Container
 from db.post_dao import PostDao
@@ -33,6 +33,9 @@ class PostService:
         self.scrape_batch_dao = ScrapeBatchDao()
         self.content_service = ContentService()
         self.user_service = UserService()
+        # Set True if any reply page could not be fetched (rate limit / network).
+        # Used by the caller to refuse marking the thread as fully done.
+        self.incomplete = False
 
     async def scrape_post(self, total_page: int, *, is_update: bool = False) -> None:
         self.scrape_batch_id = self.scrape_batch_dao.insert(
@@ -77,9 +80,22 @@ class PostService:
         pn = start_pn
 
         while pn <= end_pn:
-            posts = await get_posts(self.tid, pn)
+            try:
+                posts = await get_posts(self.tid, pn)
+            except ThreadUnavailable:
+                # Thread became unavailable mid-scrape. Treat as incomplete (so it
+                # is retried) rather than aborting and risking a false deletion.
+                self.incomplete = True
+                self.scrape_logger.error(
+                    generate_scrape_logger_msg("Thread unavailable", "FetchPosts", ["pn", pn])
+                )
+                pn += 1
+                continue
             pn += 1
             if posts is None:
+                # A reply page was lost to rate limit / network after all retries.
+                # Flag the whole thread incomplete: it must not be marked done.
+                self.incomplete = True
                 self.scrape_logger.error(generate_scrape_logger_msg("Request failed", "FetchPosts", ["pn", pn]))
                 continue
 
@@ -275,12 +291,26 @@ class PostService:
         total_page = pn
 
         while total_page >= pn:
-            comments = await get_comments(self.tid, ppid, floor, pn)
-            pn += 1
-            if comments is None:
+            try:
+                comments = await get_comments(self.tid, ppid, floor, pn)
+            except FetchIncomplete:
+                # 楼中楼某页被限流/网络丢失 → 整帖不算完整，留待重抓（绝不当作删除）
+                self.incomplete = True
                 self.scrape_logger.error(
                     generate_scrape_logger_msg(
-                        "Request failed",
+                        "Request failed (incomplete)",
+                        "FetchComments",
+                        ["floor", floor, "ppid", ppid, "pn", pn],
+                    )
+                )
+                pn += 1
+                continue
+            pn += 1
+            if comments is None:
+                # 父帖被百度判定已删除 → 无可恢复，跳过（不标记 incomplete）
+                self.scrape_logger.error(
+                    generate_scrape_logger_msg(
+                        "Parent gone",
                         "FetchComments",
                         ["floor", floor, "ppid", ppid, "pn", pn],
                     )

@@ -4,7 +4,7 @@ import time
 
 from aiotieba.api.get_posts._classdef import ShareThread_pt
 
-from api.aiotieba_client import get_posts
+from api.aiotieba_client import get_posts, ThreadUnavailable, FetchIncomplete
 from config.path_config import ScrapeDataPathBuilder
 from container.container import Container
 from pojo.scrape_info import ScrapeInfo
@@ -24,22 +24,23 @@ async def scrape(tid: int):
     scrape_start_time = time.time()
     Container.set_scrape_timestamp(int(scrape_start_time))
 
+    # Preload page 1. ThreadUnavailable (server says gone) propagates to the
+    # caller as a confirmed deletion. A None here is a transient failure, so we
+    # raise FetchIncomplete to force a retry instead of silently giving up.
     pre_post = await get_posts(tid, 1)
     if pre_post is None:
         counter.send((0, 1))
         MsgPrinter.print_tip(
             "\n".join(
                 [
-                    "\nPreload error. Possible causes:",
-                    f"{next(counter)}. Connection error, please retry.",
-                    f"{next(counter)}. Network failure, please check your network.",
-                    f"{next(counter)}. Invalid tid, please verify the input.",
-                    f"{next(counter)}. The thread may have been blocked or deleted.",
+                    "\nPreload failed after retries (transient). Will retry later. Possible causes:",
+                    f"{next(counter)}. Rate limited (429), too many requests.",
+                    f"{next(counter)}. Connection / network failure.",
                     f"{next(counter)}. BDUSS expired, please reconfigure.",
                 ]
             ),
         )
-        return
+        raise FetchIncomplete(f"preload failed for tid={tid}")
 
     scrape_data_path_builder = ScrapeDataPathBuilder.get_instance_scrape(
         pre_post.forum.fname, tid, pre_post.thread.title
@@ -61,12 +62,18 @@ async def scrape(tid: int):
         )
 
     main_thread_id = tid
-    await scrape_thread(main_thread_id)
+    incomplete = await scrape_thread(main_thread_id)
 
     share_origin_id = pre_post.thread.share_origin.tid
     if share_origin_id != 0:
         MsgPrinter.print_step_mark("Processing share_origin")
+        # share_origin completeness is secondary; it does not gate the main thread.
         await scrape_thread(share_origin_id, is_share_origin=True, share_origin=pre_post.thread.share_origin)
+
+    # If any reply page of the main thread was lost to rate limit / network,
+    # signal incomplete so the thread is retried (and not marked done).
+    if incomplete:
+        raise FetchIncomplete(f"some reply pages missing for tid={tid}")
 
     scrape_end_time = time.time()
     scrape_duration = scrape_end_time - scrape_start_time
@@ -76,9 +83,12 @@ async def scrape(tid: int):
     MsgPrinter.print_tip(f"Thread data saved to: {scrape_data_path_builder.get_item_dir()}")
 
 
-async def scrape_thread(tid: int, *, is_share_origin: bool = False, share_origin: ShareThread_pt | None = None):
+async def scrape_thread(tid: int, *, is_share_origin: bool = False, share_origin: ShareThread_pt | None = None) -> bool:
+    """Scrape one thread. Returns True if the scrape was incomplete (some reply
+    pages were lost to transient failures). Raises ThreadUnavailable if the
+    server reports the main thread is deleted/blocked."""
     if tid <= 0:
-        return
+        return False
 
     Container.set_tid(tid)
     scrape_data_path_builder = Container.get_scrape_data_path_builder()
@@ -92,7 +102,15 @@ async def scrape_thread(tid: int, *, is_share_origin: bool = False, share_origin
     MsgPrinter.print_step_mark("Starting thread scrape", ["tid", tid])
     scrape_logger.info(generate_scrape_logger_msg("Starting thread scrape", "StepMark", ["tid", tid]))
 
-    pre_fetch_posts = await get_posts(tid)
+    try:
+        pre_fetch_posts = await get_posts(tid)
+    except ThreadUnavailable:
+        # Main thread is gone -> propagate so it is marked deleted.
+        # A gone share_origin is non-fatal: fall through to save what we have.
+        if not is_share_origin:
+            final_treatment()
+            raise
+        pre_fetch_posts = None
 
     thread_service = ThreadService()
     user_service = UserService()
@@ -107,8 +125,11 @@ async def scrape_thread(tid: int, *, is_share_origin: bool = False, share_origin
                 user_service.register_user_from_id(share_origin.author_id),
                 user_service.complete_user_info(),
             )
+            final_treatment()
+            return False
+        # Main thread: transient failure fetching page 1 -> incomplete, retry later.
         final_treatment()
-        return
+        return True
 
     await asyncio.gather(
         thread_service.save_forum_info(pre_fetch_posts.forum.fid),
@@ -123,7 +144,7 @@ async def scrape_thread(tid: int, *, is_share_origin: bool = False, share_origin
         await post_service.save_post_from_floor1(pre_fetch_posts.objs[0])
 
         final_treatment()
-        return
+        return False
 
     await post_service.scrape_post(pre_fetch_posts.page.total_page)
 
@@ -134,3 +155,5 @@ async def scrape_thread(tid: int, *, is_share_origin: bool = False, share_origin
     final_treatment()
     MsgPrinter.print_step_mark("Thread scrape completed", ["tid", tid])
     scrape_logger.info(generate_scrape_logger_msg("Thread scrape completed", "StepMark", ["tid", tid]))
+    # True if any reply page was lost to transient failure.
+    return post_service.incomplete

@@ -1,0 +1,10 @@
+# Tieba-Tools 运行依赖（Python 3.11+，已在 3.13 验证）
+# 一键安装：  pip install -r requirements.txt
+aiotieba==4.7.1
+orjson==3.11.9
+aiohttp==3.13.5
+httpx==0.28.1
+protobuf==7.35.0
+lxml==6.1.1
+pillow==12.2.0
+aiofiles==25.1.0

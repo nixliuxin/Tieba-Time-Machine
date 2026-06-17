@@ -20,6 +20,7 @@ from modules.scrape_module import scrape
 from scrape_config import ScrapeConfig
 from tieba_auth import TiebaAuth
 from config.path_config import ScrapeDataPathBuilder, sanitize_filename
+from api.aiotieba_client import ThreadUnavailable, FetchIncomplete
 
 BACKOFF_INITIAL = 30
 BACKOFF_MAX = 300
@@ -472,16 +473,34 @@ async def batch_download(all_tids: list[int], output_dir: str, max_concurrency: 
                 try:
                     await _scrape_with_watchdog(tid, output_dir)
                     if not _verify_scrape(tid):
-                        raise RuntimeError(f"scrape() returned but produced no valid data (tid={tid})")
+                        # scrape() returned without raising but wrote no data.
+                        # Treat as transient/incomplete (retryable) — NEVER as deleted.
+                        raise FetchIncomplete(f"no data produced for tid={tid}")
                     async with progress_lock:
                         completed_set.add(tid)
                         _save_done_tids(output_dir, completed_set)
                         success_count += 1
                         failed_dict.pop(tid, None)
                     break
+                except ThreadUnavailable as ua:
+                    # Server positively confirmed the thread is gone. Only THIS
+                    # marks a thread as deleted (permanent skip).
+                    async with progress_lock:
+                        deleted_set.add(tid)
+                        failed_dict.pop(tid, None)
+                    log(f"  [DELETED] tid={tid}: {str(ua)[:120]}")
+                    break
+                except FetchIncomplete as fi:
+                    # Some pages were lost to rate limit / network. Keep it in the
+                    # retry queue so a later run can complete it.
+                    async with progress_lock:
+                        fail_count += 1
+                        failed_dict[tid] = f"incomplete: {str(fi)[:180]}"
+                    log(f"  [INCOMPLETE] tid={tid}: {str(fi)[:120]} (will retry later)")
+                    break
                 except asyncio.TimeoutError as te:
                     elapsed = int(time.time() - start_time)
-                    log(f"  [IDLE TIMEOUT] tid={tid}: {te} (wall {elapsed}s), skipping")
+                    log(f"  [IDLE TIMEOUT] tid={tid}: {te} (wall {elapsed}s), will retry later")
                     async with progress_lock:
                         fail_count += 1
                         failed_dict[tid] = str(te)
@@ -492,21 +511,11 @@ async def batch_download(all_tids: list[int], output_dir: str, max_concurrency: 
                         retries += 1
                         await handle_429(backoff)
                         backoff = min(backoff * 2, BACKOFF_MAX)
-                    elif "已被删除" in err or "可能已被删除" in err or "该贴已被删除" in err:
-                        async with progress_lock:
-                            deleted_set.add(tid)
-                        log(f"  [DELETED] tid={tid}")
-                        break
-                    elif "no valid data" in err:
-                        async with progress_lock:
-                            deleted_set.add(tid)
-                        log(f"  [EMPTY] tid={tid}: scrape returned no data (likely deleted)")
-                        break
                     else:
                         async with progress_lock:
                             fail_count += 1
                             failed_dict[tid] = err[:200]
-                        log(f"  [FAILED] tid={tid}: {err[:100]}")
+                        log(f"  [FAILED] tid={tid}: {err[:100]} (will retry later)")
                         break
             else:
                 async with progress_lock:
