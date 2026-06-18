@@ -1,8 +1,15 @@
+import asyncio
 import os
 import re
 
 import aiofiles
 import aiohttp
+
+# Bound every media download so a dead / hanging image host (very common for
+# old Tieba imgsrc links) fails fast instead of stalling on aiohttp's 5-minute
+# default total timeout. Without this, a single thread full of dead images can
+# take many hours, since each dead URL would otherwise block for up to 5 min.
+_DOWNLOAD_TIMEOUT = aiohttp.ClientTimeout(total=25, connect=10, sock_connect=10, sock_read=15)
 
 
 async def download_file(
@@ -23,7 +30,7 @@ async def download_file(
 
     while attempt < retries:
         try:
-            async with aiohttp.ClientSession() as session:
+            async with aiohttp.ClientSession(timeout=_DOWNLOAD_TIMEOUT) as session:
                 async with session.get(url) as response:
                     response.raise_for_status()  # 检查请求是否成功
 
@@ -48,7 +55,7 @@ async def download_file(
 
                     return filename, full_path
 
-        except aiohttp.ClientError as e:
+        except (aiohttp.ClientError, asyncio.TimeoutError):
             attempt += 1
 
     raise Exception(f"Failed to download {url} after {retries} attempts")

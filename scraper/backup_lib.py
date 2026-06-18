@@ -25,7 +25,15 @@ from api.aiotieba_client import ThreadUnavailable, FetchIncomplete
 BACKOFF_INITIAL = 30
 BACKOFF_MAX = 300
 MAX_RETRIES_PER_TID = 3
-IDLE_TIMEOUT = 180  # seconds: cancel task if no file writes for 3 min
+# Intra-thread resume retries: when a thread comes back FetchIncomplete, retry it
+# within the same pass (each round resumes from the page checkpoint). Keep going
+# while new posts are still being saved; give up only after this many consecutive
+# rounds add nothing (i.e. the remaining pages are genuinely gone, not throttled).
+INCOMPLETE_STALE_LIMIT = 3
+INCOMPLETE_MAX_ROUNDS = 300  # absolute safety cap on resume rounds per pass
+IDLE_TIMEOUT = 360  # seconds: cancel task if no file writes. Must stay above
+                    # BACKOFF_MAX (300s) so a single huge thread sitting in a long
+                    # 429 backoff is not killed mid-flight by the watchdog.
 
 
 # ── Logging (one file per session, captures all stdout/stderr) ──
@@ -366,9 +374,63 @@ async def _scrape_with_watchdog(tid: int, output_dir: str):
     return task.result()
 
 
-# ── Batch download main loop (concurrent + adaptive throttling) ──
+# ── Batch download main loop (concurrent + throughput-seeking autotune) ──
 DEFAULT_CONCURRENCY = 10
-RAMP_UP_INTERVAL = 300  # attempt to ramp up concurrency after 5 min of stability
+# Throughput-seeking concurrency controller (hill climbing on goodput).
+# Goal: maximize completed-threads-per-second, NOT minimize 429s. Running a bit
+# "over the water line" (tolerating some 429s) is fine as long as the net
+# completion rate is higher. The controller nudges concurrency up while that
+# helps and only backs off when more concurrency clearly hurts throughput.
+CONTROL_WINDOW = 90      # seconds between concurrency decisions
+EWMA_ALPHA = 0.5         # smoothing on measured goodput (dampens thread-size noise)
+GOODPUT_MARGIN = 0.10    # only step down when goodput clearly drops (>10%)
+PAUSE_ON_429 = 8         # short coordinated cool-down to avoid a 429 thundering herd
+MIN_CONCURRENCY_DIVISOR = 3  # never autotune below ~max/3: the goodput signal goes
+                             # blind on giant threads (one thread > one window), and
+                             # collapsing to 1 would serialize the whole tail behind
+                             # a single mega-thread. Keep enough parallelism to overlap.
+
+
+class DynamicSemaphore:
+    """A semaphore whose limit can change at runtime.
+
+    Unlike swapping out an ``asyncio.Semaphore`` object, this keeps a single
+    shared counter, so lowering the limit after a 429 actually throttles new
+    acquisitions while in-flight holders are allowed to finish (never preempted).
+    """
+
+    def __init__(self, limit: int):
+        self._limit = max(1, limit)
+        self._active = 0
+        self._cond = asyncio.Condition()
+
+    @property
+    def limit(self) -> int:
+        return self._limit
+
+    async def acquire(self):
+        async with self._cond:
+            while self._active >= self._limit:
+                await self._cond.wait()
+            self._active += 1
+
+    async def release(self):
+        async with self._cond:
+            self._active = max(0, self._active - 1)
+            self._cond.notify_all()
+
+    async def set_limit(self, new_limit: int):
+        new_limit = max(1, new_limit)
+        async with self._cond:
+            self._limit = new_limit
+            self._cond.notify_all()  # wake waiters in case the limit increased
+
+    async def __aenter__(self):
+        await self.acquire()
+        return self
+
+    async def __aexit__(self, *exc):
+        await self.release()
 
 
 async def batch_download(all_tids: list[int], output_dir: str, max_concurrency: int = DEFAULT_CONCURRENCY):
@@ -397,67 +459,104 @@ async def batch_download(all_tids: list[int], output_dir: str, max_concurrency: 
     processed_count = 0
     start_time = time.time()
 
-    # adaptive throttling state
+    # ── throughput-seeking concurrency controller (hill climbing) ──
+    # current_concurrency: effective in-flight limit right now.
+    # The autotuner measures completed-threads-per-second each window and walks
+    # concurrency toward the throughput peak. A 429 no longer caps concurrency;
+    # it only triggers a brief coordinated pause. Concurrency is driven purely
+    # by measured goodput, so the system happily runs over the water line when
+    # that is genuinely faster, and backs off only when it stops paying off.
+    # Start at full concurrency and let the autotuner pull back only if more
+    # concurrency demonstrably hurts throughput. A hard floor keeps the tail
+    # (giant threads) overlapping instead of serializing down to 1.
+    min_concurrency = max(2, max_concurrency // MIN_CONCURRENCY_DIVISOR)
     current_concurrency = max_concurrency
-    semaphore = asyncio.Semaphore(current_concurrency)
+    semaphore = DynamicSemaphore(current_concurrency)
     throttle_lock = asyncio.Lock()
     progress_lock = asyncio.Lock()
     last_429_time = 0.0
-    last_ramp_up_time = time.time()
     global_paused = asyncio.Event()
     global_paused.set()  # initially not paused
 
-    async def adjust_concurrency(new_n: int):
-        nonlocal current_concurrency, semaphore, last_ramp_up_time
+    # hill-climbing state
+    hc_last_success = 0
+    hc_last_time = time.time()
+    hc_prev_goodput = None   # previous (smoothed) goodput, threads/sec
+    hc_direction = 1         # start by exploring upward
+
+    async def adjust_concurrency(new_n: int, reason: str = ""):
+        nonlocal current_concurrency
+        new_n = max(min_concurrency, min(max_concurrency, new_n))
         if new_n == current_concurrency:
             return
         old = current_concurrency
         current_concurrency = new_n
-        semaphore = asyncio.Semaphore(new_n)
-        last_ramp_up_time = time.time()
-        log(f"  [THROTTLE] Concurrency adjusted: {old} -> {new_n}")
+        await semaphore.set_limit(new_n)
+        log(f"  [AUTOTUNE] concurrency {old} -> {new_n} {reason}")
 
     async def handle_429(backoff_time: float):
         nonlocal last_429_time
         async with throttle_lock:
             now = time.time()
             if now - last_429_time < 5:
-                return  # another worker is already handling this
+                return  # another worker already reacted to this burst
             last_429_time = now
             global_paused.clear()
-            new_n = max(current_concurrency // 2, 1)
-            await adjust_concurrency(new_n)
-            log(f"  [429] Global pause {backoff_time:.0f}s ...")
-        await asyncio.sleep(backoff_time)
+        # Brief coordinated cool-down only; the autotuner owns concurrency.
+        await asyncio.sleep(min(backoff_time, PAUSE_ON_429))
         global_paused.set()
 
-    async def maybe_ramp_up():
-        nonlocal last_ramp_up_time
-        if current_concurrency >= max_concurrency:
+    async def autotune():
+        # Called periodically by the progress reporter; acts once per window.
+        nonlocal hc_last_success, hc_last_time, hc_prev_goodput, hc_direction
+        now = time.time()
+        win = now - hc_last_time
+        if win < CONTROL_WINDOW:
             return
-        if time.time() - last_ramp_up_time < RAMP_UP_INTERVAL:
-            return
-        if time.time() - last_429_time < RAMP_UP_INTERVAL:
-            return
-        async with throttle_lock:
-            if current_concurrency < max_concurrency:
-                await adjust_concurrency(current_concurrency + 1)
 
-    def _verify_scrape(tid: int) -> bool:
-        """Check if scrape() actually completed (content.db exists and has data)."""
+        goodput = max(0.0, (success_count - hc_last_success) / win)  # threads/sec
+        hc_last_success = success_count
+        hc_last_time = now
+
+        if hc_prev_goodput is None:
+            smoothed = goodput
+        else:
+            smoothed = EWMA_ALPHA * goodput + (1 - EWMA_ALPHA) * hc_prev_goodput
+
+        async with throttle_lock:
+            if hc_prev_goodput is not None and hc_prev_goodput > 0:
+                rel = (smoothed - hc_prev_goodput) / hc_prev_goodput
+                # Push up while it helps or is roughly flat (over-the-line is OK);
+                # step down only when more concurrency clearly hurt throughput.
+                hc_direction = -1 if rel < -GOODPUT_MARGIN else 1
+            else:
+                hc_direction = 1
+            await adjust_concurrency(
+                current_concurrency + hc_direction,
+                reason=f"[goodput {smoothed*3600:.0f}/h dir{hc_direction:+d}]",
+            )
+        hc_prev_goodput = smoothed
+
+    def _count_posts(tid: int) -> int:
+        """Number of posts stored so far for a tid (0 if none). Used as a
+        progress signal to decide whether resume retries are still paying off."""
         tid_pattern = f"[{tid}]"
-        for name in os.listdir(output_dir):
-            if tid_pattern in name and os.path.isdir(os.path.join(output_dir, name)):
-                db_path = os.path.join(output_dir, name, "threads", str(tid), "content.db")
-                if os.path.exists(db_path):
-                    try:
+        try:
+            for name in os.listdir(output_dir):
+                if tid_pattern in name and os.path.isdir(os.path.join(output_dir, name)):
+                    db_path = os.path.join(output_dir, name, "threads", str(tid), "content.db")
+                    if os.path.exists(db_path):
                         conn = sqlite3.connect(db_path)
                         count = conn.execute("SELECT COUNT(*) FROM post").fetchone()[0]
                         conn.close()
-                        return count > 0
-                    except Exception:
-                        return False
-        return False
+                        return count
+        except Exception:
+            pass
+        return 0
+
+    def _verify_scrape(tid: int) -> bool:
+        """Check if scrape() actually completed (content.db exists and has data)."""
+        return _count_posts(tid) > 0
 
     async def process_tid(tid: int):
         nonlocal success_count, fail_count, processed_count
@@ -466,9 +565,15 @@ async def batch_download(all_tids: list[int], output_dir: str, max_concurrency: 
         async with semaphore:
             await global_paused.wait()
 
-            cleanup_incomplete_tid(output_dir, tid)
+            # NOTE: do NOT wipe a partially-scraped thread here. The scraper now
+            # resumes intra-thread from a per-page checkpoint, so keeping the
+            # existing content.db lets a retry fetch only the missing pages
+            # instead of re-downloading a huge thread from scratch.
             retries = 0
             backoff = BACKOFF_INITIAL
+            incomplete_stale = 0       # consecutive resume rounds that added no posts
+            incomplete_rounds = 0      # total resume rounds (absolute safety cap)
+            last_post_count = _count_posts(tid)
             while retries < MAX_RETRIES_PER_TID:
                 try:
                     await _scrape_with_watchdog(tid, output_dir)
@@ -491,13 +596,32 @@ async def batch_download(all_tids: list[int], output_dir: str, max_concurrency: 
                     log(f"  [DELETED] tid={tid}: {str(ua)[:120]}")
                     break
                 except FetchIncomplete as fi:
-                    # Some pages were lost to rate limit / network. Keep it in the
-                    # retry queue so a later run can complete it.
-                    async with progress_lock:
-                        fail_count += 1
-                        failed_dict[tid] = f"incomplete: {str(fi)[:180]}"
-                    log(f"  [INCOMPLETE] tid={tid}: {str(fi)[:120]} (will retry later)")
-                    break
+                    # Some pages were lost to rate limit / network. With intra-thread
+                    # resume we retry right here: each round continues from the page
+                    # checkpoint, so we only re-fetch the pages still missing. Keep
+                    # going while new posts keep landing (a "fake" miss that just
+                    # needs more passes); give up only when several rounds in a row
+                    # add nothing — those pages are genuinely gone.
+                    now_count = _count_posts(tid)
+                    incomplete_rounds += 1
+                    if now_count > last_post_count:
+                        incomplete_stale = 0
+                    else:
+                        incomplete_stale += 1
+                    last_post_count = now_count
+                    if (incomplete_stale >= INCOMPLETE_STALE_LIMIT
+                            or incomplete_rounds >= INCOMPLETE_MAX_ROUNDS):
+                        async with progress_lock:
+                            fail_count += 1
+                            failed_dict[tid] = f"incomplete: {str(fi)[:180]}"
+                        log(f"  [INCOMPLETE] tid={tid}: no new data after "
+                            f"{incomplete_stale} resume rounds ({now_count} posts): "
+                            f"{str(fi)[:90]} (giving up this pass)")
+                        break
+                    log(f"  [RESUME] tid={tid}: {str(fi)[:80]} -> continue from "
+                        f"checkpoint (round {incomplete_rounds}, {now_count} posts)")
+                    await asyncio.sleep(2)
+                    continue
                 except asyncio.TimeoutError as te:
                     elapsed = int(time.time() - start_time)
                     log(f"  [IDLE TIMEOUT] tid={tid}: {te} (wall {elapsed}s), will retry later")
@@ -548,16 +672,30 @@ async def batch_download(all_tids: list[int], output_dir: str, max_concurrency: 
                 "completed_total": len(completed_set),
                 "last_update": time.strftime("%Y-%m-%d %H:%M:%S"),
             })
-            await maybe_ramp_up()
+            await autotune()
 
     # launch concurrent downloads
     reporter_task = asyncio.create_task(progress_reporter())
 
-    batch_size = 50
-    for batch_start in range(0, len(remaining), batch_size):
-        batch = remaining[batch_start:batch_start + batch_size]
-        tasks = [asyncio.create_task(process_tid(tid)) for tid in batch]
-        await asyncio.gather(*tasks)
+    # Continuously-refilled sliding window: keep a little more than the hard cap
+    # in flight so the DynamicSemaphore is the *only* throttle. This avoids the
+    # batch-boundary stalls of fixed gather() batches, where one slow (huge)
+    # thread would idle every other worker until the whole batch finished.
+    window = max_concurrency + 4
+    it = iter(remaining)
+    pending: set[asyncio.Task] = set()
+    for _ in range(window):
+        tid = next(it, None)
+        if tid is None:
+            break
+        pending.add(asyncio.create_task(process_tid(tid)))
+
+    while pending:
+        done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+        for _ in done:
+            tid = next(it, None)
+            if tid is not None:
+                pending.add(asyncio.create_task(process_tid(tid)))
 
     reporter_task.cancel()
     try:

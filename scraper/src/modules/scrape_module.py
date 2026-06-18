@@ -4,7 +4,7 @@ import time
 
 from aiotieba.api.get_posts._classdef import ShareThread_pt
 
-from api.aiotieba_client import get_posts, ThreadUnavailable, FetchIncomplete
+from api.aiotieba_client import get_posts, ThreadUnavailable, FetchIncomplete, EMPTY_PAGE
 from config.path_config import ScrapeDataPathBuilder
 from container.container import Container
 from pojo.scrape_info import ScrapeInfo
@@ -28,7 +28,7 @@ async def scrape(tid: int):
     # caller as a confirmed deletion. A None here is a transient failure, so we
     # raise FetchIncomplete to force a retry instead of silently giving up.
     pre_post = await get_posts(tid, 1)
-    if pre_post is None:
+    if pre_post is None or pre_post is EMPTY_PAGE:
         counter.send((0, 1))
         MsgPrinter.print_tip(
             "\n".join(
@@ -71,9 +71,17 @@ async def scrape(tid: int):
         await scrape_thread(share_origin_id, is_share_origin=True, share_origin=pre_post.thread.share_origin)
 
     # If any reply page of the main thread was lost to rate limit / network,
-    # signal incomplete so the thread is retried (and not marked done).
+    # signal incomplete so the thread is retried (and not marked done). The
+    # per-page checkpoint is kept so the retry resumes instead of restarting.
     if incomplete:
         raise FetchIncomplete(f"some reply pages missing for tid={tid}")
+
+    # Fully complete -> the resume checkpoint is no longer needed.
+    checkpoint = os.path.join(scrape_data_path_builder.get_thread_dir(tid), "_pages_done.json")
+    try:
+        os.remove(checkpoint)
+    except OSError:
+        pass
 
     scrape_end_time = time.time()
     scrape_duration = scrape_end_time - scrape_start_time
@@ -110,6 +118,11 @@ async def scrape_thread(tid: int, *, is_share_origin: bool = False, share_origin
         if not is_share_origin:
             final_treatment()
             raise
+        pre_fetch_posts = None
+
+    # An empty page 1 is not usable thread data; treat it like a transient miss
+    # (retry later) rather than a deletion or a parseable thread.
+    if pre_fetch_posts is EMPTY_PAGE:
         pre_fetch_posts = None
 
     thread_service = ThreadService()

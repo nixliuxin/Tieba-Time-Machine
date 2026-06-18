@@ -6,7 +6,7 @@ import orjson
 import questionary
 
 import config.scraper_config as scraper_config
-from api.aiotieba_client import get_posts
+from api.aiotieba_client import get_posts, EMPTY_PAGE
 from config.path_config import ScrapeDataPathBuilder
 from container.container import Container
 from pojo.scrape_info import ScrapeInfoDict, ScrapeRecordDict
@@ -103,7 +103,7 @@ async def update_thread(tid: int, *, is_share_origin=False):
     scrape_logger.info(generate_scrape_logger_msg("Starting thread update", "StepMark", ["tid", tid]))
 
     pre_fetch_posts = await get_posts(tid)
-    if pre_fetch_posts is None:
+    if pre_fetch_posts is None or pre_fetch_posts is EMPTY_PAGE:
         final_treatment()
         MsgPrinter.print_error(f"Thread may have been deleted", "ScrapeUpdate", ["tid", tid])
         scrape_logger.error(generate_scrape_logger_msg("Thread may have been deleted", "ScrapeUpdate", ["tid", tid]))

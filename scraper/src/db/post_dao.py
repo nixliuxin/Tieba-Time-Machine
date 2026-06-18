@@ -49,8 +49,11 @@ class PostDao:
         return self.post_entity_factory_from_tuple(cursor.fetchone())
 
     def insert(self, entity: PostEntity):
+        # OR IGNORE makes re-scraping idempotent: when a thread is resumed and a
+        # page is re-fetched, posts already stored (same pid) are skipped instead
+        # of raising an IntegrityError on the primary key.
         sql = """
-        INSERT INTO post(id, contents, floor, user_id, agree, disagree, create_time,
+        INSERT OR IGNORE INTO post(id, contents, floor, user_id, agree, disagree, create_time,
             is_thread_author,
             sign,
             reply_num,

@@ -1,3 +1,4 @@
+import asyncio
 from urllib.parse import urlparse, parse_qs, quote
 
 import orjson
@@ -62,12 +63,15 @@ class ContentService:
     async def process_contents(
             self, objs: list, affiliation: ContentsAffiliation
     ) -> str:
-        contents = list[ContentFrag]()
+        # Fragments are independent (media downloads write to per-index files),
+        # so fetch them concurrently instead of one-by-one. This is a big win for
+        # image-heavy posts (e.g. 八图 floors) where serial downloads dominate
+        # the runtime. asyncio.gather preserves input order.
+        contents = await asyncio.gather(
+            *(self.process_frag(obj, idx, affiliation) for idx, obj in enumerate(objs))
+        )
 
-        for idx, obj in enumerate(objs):
-            contents.append(await self.process_frag(obj, idx, affiliation))
-
-        return orjson.dumps(contents).decode("utf-8")
+        return orjson.dumps(list(contents)).decode("utf-8")
 
     # 根据类名来获取处理函数
     async def process_frag(

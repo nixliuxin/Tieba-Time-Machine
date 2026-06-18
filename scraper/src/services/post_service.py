@@ -1,9 +1,11 @@
 import asyncio
+import json
 import math
+import os
 
 from aiotieba.typing import Posts, Comments, Post
 
-from api.aiotieba_client import get_posts, get_comments, ThreadUnavailable, FetchIncomplete
+from api.aiotieba_client import get_posts, get_comments, ThreadUnavailable, FetchIncomplete, EMPTY_PAGE
 from config.scraper_config import SCRAPER_VERSION
 from container.container import Container
 from db.post_dao import PostDao
@@ -36,11 +38,54 @@ class PostService:
         # Set True if any reply page could not be fetched (rate limit / network).
         # Used by the caller to refuse marking the thread as fully done.
         self.incomplete = False
+        # Intra-thread resume: page numbers whose main posts (and their comments)
+        # are fully saved. Persisted to a sidecar so a re-scrape only fetches the
+        # pages still missing, instead of throwing away the whole thread.
+        self.done_pages: set[int] = set()
+        self._checkpoint_path: str | None = None
+
+    def _load_done_pages(self) -> None:
+        self._checkpoint_path = os.path.join(
+            self.scrape_data_path_builder.get_thread_dir(self.tid), "_pages_done.json"
+        )
+        try:
+            with open(self._checkpoint_path, "r", encoding="utf-8") as f:
+                self.done_pages = set(json.load(f))
+        except (OSError, ValueError):
+            self.done_pages = set()
+
+    def _mark_page_done(self, pn: int) -> None:
+        if pn <= 0 or pn in self.done_pages:
+            return
+        self.done_pages.add(pn)
+        if not self._checkpoint_path:
+            return
+        # Atomic write so a crash mid-write never corrupts the checkpoint.
+        tmp = f"{self._checkpoint_path}.tmp"
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(sorted(self.done_pages), f)
+            os.replace(tmp, self._checkpoint_path)
+        except OSError:
+            pass
 
     async def scrape_post(self, total_page: int, *, is_update: bool = False) -> None:
         self.scrape_batch_id = self.scrape_batch_dao.insert(
             SCRAPER_VERSION, json_dumps(ScrapeConfig.to_dict(), False), Container.get_scrape_timestamp()
         )
+
+        # Remember the reported page count so fetch_post can tell a legitimate
+        # trailing empty page (total_page over-counts) from a mid-thread gap.
+        self._total_page = total_page
+
+        # On a resume, skip pages already fully archived in a previous attempt.
+        self._load_done_pages()
+        if self.done_pages:
+            already = len([p for p in self.done_pages if p <= total_page])
+            MsgPrinter.print_tip(
+                f"Resuming thread: {already}/{total_page} reply pages already saved, fetching the rest.",
+                ["tid", self.tid],
+            )
 
         queue_maxsize = 10
         max_producers_num = 3
@@ -80,6 +125,10 @@ class PostService:
         pn = start_pn
 
         while pn <= end_pn:
+            # Resume: page already fully saved in a prior attempt -> don't refetch.
+            if pn in self.done_pages:
+                pn += 1
+                continue
             try:
                 posts = await get_posts(self.tid, pn)
             except ThreadUnavailable:
@@ -91,12 +140,27 @@ class PostService:
                 )
                 pn += 1
                 continue
+            fetched_pn = pn
             pn += 1
+            if posts is EMPTY_PAGE:
+                # Server returned a valid-but-empty page. If it's at/after the
+                # reported last page, total_page simply over-counted (trailing
+                # replies deleted) -> this page is legitimately empty, so mark it
+                # done and let the thread complete. An empty page *before* the
+                # last one is a real gap -> keep the thread incomplete.
+                if fetched_pn >= self._total_page:
+                    self._mark_page_done(fetched_pn)
+                else:
+                    self.incomplete = True
+                    self.scrape_logger.error(
+                        generate_scrape_logger_msg("Empty page mid-thread", "FetchPosts", ["pn", fetched_pn])
+                    )
+                continue
             if posts is None:
                 # A reply page was lost to rate limit / network after all retries.
                 # Flag the whole thread incomplete: it must not be marked done.
                 self.incomplete = True
-                self.scrape_logger.error(generate_scrape_logger_msg("Request failed", "FetchPosts", ["pn", pn]))
+                self.scrape_logger.error(generate_scrape_logger_msg("Request failed", "FetchPosts", ["pn", fetched_pn]))
                 continue
 
             await contact.tasks_queue.put(posts)
@@ -116,6 +180,12 @@ class PostService:
                 if posts is None:
                     return
 
+                # Track completeness of this single page so it can be checkpointed
+                # for intra-thread resume. A page is "done" only if every post and
+                # every comment page on it was saved without a transient failure.
+                page_pn = posts.page.current_page
+                page_failed = False
+
                 for post in posts.objs:
                     try:
                         # Comment 1
@@ -128,13 +198,14 @@ class PostService:
                             )
 
                             if len(post.comments) != 0:
-                                await self.scrape_comments(
+                                if await self.scrape_comments(
                                     post.pid,
                                     post.floor,
                                     posts.page.current_page,
                                     post.reply_num,
                                     is_update=True,
-                                )
+                                ):
+                                    page_failed = True
                             continue
 
                         if (
@@ -169,12 +240,13 @@ class PostService:
                         MsgPrinter.print_success("", "SavePost", ["floor", post.floor, "pid", post.pid])
 
                         if len(post.comments) > 0:
-                            await self.scrape_comments(
+                            if await self.scrape_comments(
                                 post.pid,
                                 post.floor,
                                 posts.page.current_page,
                                 post.reply_num,
-                            )
+                            ):
+                                page_failed = True
 
                         if (not post.is_thread_author) and (
                             PostFilterType.AUTHOR_AND_REPLIED_POSTS_WITH_SUBPOSTS
@@ -198,6 +270,7 @@ class PostService:
                                     await self.delete_post_assets(row[0])
 
                     except Exception as e:
+                        page_failed = True
                         MsgPrinter.print_error(
                             str(e),
                             "SavePost",
@@ -224,6 +297,10 @@ class PostService:
                                 ],
                             )
                         )
+
+                # Whole page (and its comments) saved cleanly -> checkpoint it.
+                if not page_failed:
+                    self._mark_page_done(page_pn)
             except asyncio.TimeoutError:
                 if contact.running_producers == 0:
                     return
@@ -274,21 +351,26 @@ class PostService:
         reply_num: int,
         *,
         is_update: bool = False,
-    ) -> None:
+    ) -> bool:
+        """Returns True if any comment page was lost to a transient failure
+        (so the enclosing reply page must not be checkpointed as done)."""
         queue_maxsize = 8 if reply_num > 8 else reply_num
         producers_num = 1
         consumers_num = queue_maxsize
         consumer_await_timeout = 8
         contact = ProducerConsumerContact(queue_maxsize, producers_num, consumers_num, consumer_await_timeout)
 
-        await asyncio.gather(
+        results = await asyncio.gather(
             self.fetch_comments(contact, ppid, floor),
             *[self.save_comments(contact, ppn, is_update) for _ in range(consumers_num)],
         )
+        # results[0] is fetch_comments' return value (incomplete flag).
+        return bool(results[0])
 
-    async def fetch_comments(self, contact: ProducerConsumerContact, ppid: int, floor: int):
+    async def fetch_comments(self, contact: ProducerConsumerContact, ppid: int, floor: int) -> bool:
         pn = 1
         total_page = pn
+        incomplete = False
 
         while total_page >= pn:
             try:
@@ -296,6 +378,7 @@ class PostService:
             except FetchIncomplete:
                 # 楼中楼某页被限流/网络丢失 → 整帖不算完整，留待重抓（绝不当作删除）
                 self.incomplete = True
+                incomplete = True
                 self.scrape_logger.error(
                     generate_scrape_logger_msg(
                         "Request failed (incomplete)",
@@ -327,6 +410,8 @@ class PostService:
         if contact.running_producers == 0:
             for _ in range(contact.consumers_num):
                 await contact.tasks_queue.put(None)
+
+        return incomplete
 
     async def save_comments(self, contact: ProducerConsumerContact, ppn: int, is_update: bool = False):
         while True:

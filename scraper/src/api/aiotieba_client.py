@@ -3,9 +3,13 @@ import asyncio
 import aiotieba as tb
 from aiotieba.exception import TiebaServerError
 
+from api.aiotieba_patch import apply_patches as _apply_aiotieba_patches
 from scrape_config import ScrapeConfig, PostFilterType
 from tieba_auth import TiebaAuth
 from utils.msg_printer import MsgPrinter
+
+# Fix aiotieba 4.7.1's thread_type parsing bug before any request is made.
+_apply_aiotieba_patches()
 
 
 class ThreadUnavailable(Exception):
@@ -28,6 +32,24 @@ class FetchIncomplete(Exception):
 # so that 429 rate limits actually get a chance to clear.
 _BACKOFF_BASE = 3
 _BACKOFF_MAX = 60
+
+
+class _EmptyPage:
+    """Sentinel for a well-formed but empty page (server answered with no error
+    yet returned no thread/posts). This is STABLE, not a transient failure: it
+    happens when Tieba's reported total_page over-counts (e.g. trailing replies
+    were deleted), so the real last page(s) come back empty. Distinct from None
+    (transient failure) so callers can treat a trailing empty page as a
+    legitimate end-of-thread instead of a lost page that blocks completion.
+    """
+
+    __slots__ = ()
+
+    def __repr__(self):  # pragma: no cover - debug aid only
+        return "EMPTY_PAGE"
+
+
+EMPTY_PAGE = _EmptyPage()
 
 
 def _is_permanent_error(err) -> bool:
@@ -92,8 +114,14 @@ async def get_posts(tid: int, pn=1, retry=4):
             posts = await client.get_posts(tid, pn, with_comments=True, only_thread_author=only_thread_author)
 
         err = getattr(posts, "err", None)
-        if err is None and posts.thread.tid != 0:
-            return posts
+        if err is None:
+            if posts.thread.tid != 0:
+                return posts
+            # Well-formed response, but no thread data -> this page is empty.
+            # Empty pages are stable, so don't burn retries on them; hand back a
+            # sentinel and let the caller decide (a trailing empty page is fine;
+            # an empty page before the real end is suspicious).
+            return EMPTY_PAGE
 
         if _is_permanent_error(err):
             MsgPrinter.print_error(
