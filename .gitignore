@@ -19,7 +19,9 @@ frontend/.vite/
 # IDE / AI tools
 .vscode/
 .idea/
-.cursor/
+.cursor/*
+!.cursor/rules/
+!.cursor/rules/**
 
 # OS
 .DS_Store
@@ -35,6 +37,9 @@ auth.json
 
 # Runtime config (contains local paths)
 server/sources.json
+
+# Local operator scripts (personal paths, batch jobs — never commit)
+tools/_*.py
 
 # Runtime data
 scraped_data/

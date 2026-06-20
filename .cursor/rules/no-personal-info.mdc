@@ -1,0 +1,56 @@
+---
+description: Do not leak author personal backup stats, paths, or identifiers in published repo content
+alwaysApply: true
+---
+
+# No Personal Information in Published Content
+
+This is a **public open-source** project. Never embed the maintainer's (or any
+user's) real archive statistics, local paths, forum choices, or account details
+in content that ships with or is published from the repo.
+
+## Forbidden in repo-published content
+
+Includes release notes, README/examples, docs, commit messages, PR descriptions,
+CLI help examples, code comments, and AI rule files:
+
+- **Backup statistics from a real run** — e.g. exact thread/forum counts, archive
+  sizes, batch success ratios from a personal scrape
+- **Local or cloud paths** — e.g. `L:\DATA`, `D:\archives`, Dropbox archive paths,
+  `C:\<workdir>\...`
+- **Real forum / user archive names** tied to the author — e.g. specific school or
+  city bar names, `Ba_<forum>_YYMMDD` folders from a personal batch,
+  `User_<nickname>_YYMMDD` collections
+- **Real thread IDs (tid)** used as personal debug fixtures
+- **Session / auth artifacts** — BDUSS values, `tieba_auth.json` contents, cookies
+
+## Use generic placeholders instead
+
+| Instead of | Use |
+|---|---|
+| `L:\DATA\ExampleForum` | `./data/<forum-name>`, `<raw-dir>`, `<archive-dir>` |
+| `Ba_ExampleForum_260101` | `Ba_<forum>_YYMMDD` |
+| `User_MyNick_260101` | `User_<name>_YYMMDD` |
+| `tieba scrape ExampleForum` | `tieba scrape 魔兽世界` or `tieba scrape <forum-name>` |
+| `tid=1234567890 (debug note …)` | `tid=<example-tid>` with a generic note |
+
+## Allowed
+
+- **Runtime UI / server** — reader showing the *current user's* loaded archive
+  (data stays local; not authored into the repo)
+- **Copyright / author name** in LICENSE and About page
+- **Public GitHub URLs** for the project itself
+- **Protocol constants** required by Tieba/Baidu APIs
+- **Generic product examples** in README (e.g. `魔兽世界`) that are not the
+  maintainer's personal archives
+
+## Local-only scripts
+
+Personal batch drivers (`tools/_drive.py`, `tools/_probe_del.py`, etc.) must
+**not** be committed. Keep them gitignored under `tools/_*.py`.
+
+## Before publishing releases or docs
+
+Scan for drive letters with project-specific folders, real bar names, dated
+archive folder names from personal runs, and real tids in examples. Replace with
+generic placeholders.

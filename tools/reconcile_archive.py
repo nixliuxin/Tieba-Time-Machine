@@ -20,7 +20,7 @@ reconcile_archive.py - 对账并增量修复归档中"已完成但其实缺页"�
   python reconcile_archive.py audit --archive "<...>/Ba_xxx_YYMMDD"
 
   # 2) 把可疑帖子准备成重抓任务
-  #    (a) 归档对应的 raw 目录还在（例如正在抓的吧）：直接把可疑 tid 从 _done_tids.json 移除
+  #    (a) 归档对应的 raw 目录还在：直接把可疑 tid 从 _done_tids.json 移除
   python reconcile_archive.py prepare --suspects "<archive>/_reconcile.json" --raw "./data/<forum-name>"
   #    (b) raw 已删除：在一个新目录里生成只含可疑 tid 的抓取任务
   python reconcile_archive.py prepare --suspects "<archive>/_reconcile.json" --new-raw "./data/_rescrape_<forum-name>" --forum "<forum-name>"

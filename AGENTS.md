@@ -7,6 +7,7 @@ For format-specific knowledge, see `.cursor/rules/`:
 
 - `english-only.mdc` — language policy
 - `no-cursor-attribution.mdc` — commit hygiene
+- `no-personal-info.mdc` — no personal stats/paths/forums in published content
 - `versioning.mdc` — SemVer policy
 
 ## What this repo is
@@ -50,10 +51,15 @@ backend (`server/`), and a React single-page viewer (`frontend/`).
    already validated data.
 5. **No hardcoded local paths** in committed code. Use environment
    variables or CLI arguments for data directories. Paths like
-   `L:\BAIDU` or `L:\BAIDU02` must never appear in source.
+   `L:\DATA` or `D:\archives` must never appear in source.
 6. **Per-forum isolation.** Each forum produces its own independent
    archive (master.db + media.tar + par2). The reader loads one or
    more forums dynamically.
+7. **No personal information in published content.** Release notes, docs,
+   commit messages, CLI help examples, and comments must not include real
+   backup statistics, local/cloud paths, personal forum names, or thread IDs
+   from a personal run. Use generic placeholders. Personal batch scripts
+   belong in gitignored `tools/_*.py` only. See `.cursor/rules/no-personal-info.mdc`.
 
 ## Pipeline overview
 
@@ -80,3 +86,4 @@ Scrape (backup_forum.py)
 - English-only policy → `.cursor/rules/english-only.mdc`
 - Commit hygiene → `.cursor/rules/no-cursor-attribution.mdc`
 - Versioning → `.cursor/rules/versioning.mdc`
+- No personal info → `.cursor/rules/no-personal-info.mdc`
