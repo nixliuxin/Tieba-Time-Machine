@@ -75,12 +75,17 @@ def _load_forum_from_dir(forum_dir: str, name: str, collection: str = None):
             with open(idx_path, "r", encoding="utf-8") as f:
                 media_index = json.load(f)
             break
-    tar_path = None
-    for tar_name in ("data.tar", "media.tar"):
-        candidate = os.path.join(forum_dir, tar_name)
-        if os.path.exists(candidate):
-            tar_path = candidate
-            break
+    # An archive may hold more than one tar (e.g. media.tar written by an early
+    # pipeline plus data.tar from a later one), so register every tar present.
+    # A v2 index names the owning tar per entry; older indexes name only one.
+    tar_paths = {}
+    for entry in sorted(os.listdir(forum_dir)):
+        if entry.endswith(".tar"):
+            tar_paths[entry] = os.path.join(forum_dir, entry)
+    default_tar = media_index.get("tar_file")
+    if default_tar not in tar_paths:
+        default_tar = next((t for t in ("data.tar", "media.tar") if t in tar_paths), None)
+    tar_path = tar_paths.get(default_tar)
 
     key = f"{collection}/{name}" if collection else name
     if key in _forums:
@@ -90,6 +95,7 @@ def _load_forum_from_dir(forum_dir: str, name: str, collection: str = None):
         "db_path": db_path,
         "media_index": media_index,
         "tar_path": tar_path,
+        "tar_paths": tar_paths,
         "source_path": os.path.dirname(forum_dir),
         "collection": collection,
         "display_name": name,
@@ -493,6 +499,41 @@ def get_thread(tid: int, forum: Optional[str] = None):
     }
 
 
+def _read_member_at(tar_path: str, name: str, offset):
+    """Seek straight to a member and read it. None if the offset does not hold it.
+
+    A tar has no central directory, so without an offset the only way to locate a
+    member is to walk the archive from the start. On a multi-gigabyte tar that
+    costs a full read per request, which is why the index records offsets.
+    """
+    if offset is None:
+        return None
+    try:
+        with open(tar_path, "rb") as fh:
+            fh.seek(offset)
+            with tarfile.open(fileobj=fh, mode="r:") as tf:
+                member = tf.next()
+                if member is None or member.name != name:
+                    return None
+                extracted = tf.extractfile(member)
+                return extracted.read() if extracted else None
+    except Exception:
+        return None
+
+
+def _read_member_by_scan(tar_path: str, name: str):
+    """Walk the tar looking for a member by name. Fallback for stale offsets."""
+    try:
+        with tarfile.open(tar_path, "r:") as tf:
+            for member in tf:
+                if member.name == name:
+                    extracted = tf.extractfile(member)
+                    return extracted.read() if extracted else None
+    except Exception:
+        return None
+    return None
+
+
 @app.get("/api/media/{forum}/{path:path}")
 def get_media(forum: str, path: str):
     """Read media file on demand from tar archive."""
@@ -505,31 +546,22 @@ def get_media(forum: str, path: str):
     if not file_info:
         raise HTTPException(404, f"Media file '{path}' not found")
 
-    tar_path = forum_info["tar_path"]
+    tar_paths = forum_info.get("tar_paths") or {}
+    # v2 indexes name the owning tar per entry; older ones fall back to the
+    # archive default resolved at load time.
+    tar_path = tar_paths.get(file_info.get("tar")) or forum_info["tar_path"]
     if not tar_path or not os.path.exists(tar_path):
         raise HTTPException(500, "Tar file not found")
 
-    try:
-        with tarfile.open(tar_path, "r:") as tf:
-            member = None
-            for m in tf:
-                if m.name == path:
-                    member = m
-                    break
-
-            if member is None:
-                raise HTTPException(404, "File not found in tar")
-
-            f = tf.extractfile(member)
-            if f is None:
-                raise HTTPException(500, "Cannot extract file")
-
-            data = f.read()
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(500, f"Error reading media: {e}")
+    data = _read_member_at(tar_path, path, file_info.get("offset"))
+    if data is None:
+        # Stale or absent offset: fall back to a name scan across every tar.
+        for candidate in (tar_path, *tar_paths.values()):
+            data = _read_member_by_scan(candidate, path)
+            if data is not None:
+                break
+    if data is None:
+        raise HTTPException(404, "File not found in tar")
 
     ext = os.path.splitext(path)[1].lower()
     content_types = {

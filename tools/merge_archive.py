@@ -18,7 +18,10 @@ import time
 from pathlib import Path
 
 
-FOLDER_PATTERN = re.compile(r"^\[(.+?)吧\]\[(\d+)\](.*)$")
+# The forum segment may be empty: a thread whose forum name came back blank is
+# saved as `[吧][<tid>]<title>`. Requiring at least one character there made the
+# scan skip those folders silently, so their threads never reached master.db.
+FOLDER_PATTERN = re.compile(r"^\[(.*?)吧\]\[(\d+)\](.*)$")
 
 SCHEMA_PATH = Path(__file__).parent / "schema.sql"
 
@@ -106,13 +109,60 @@ def merge_thread_json(conn: sqlite3.Connection, thread_json_path: str, tid: int,
     )
 
 
+def _free_forum_id(conn: sqlite3.Connection) -> int:
+    """Pick a placeholder id for a forum whose real one is unknown or taken.
+
+    The forum table keys on forum_id, so two sub-forums that both report id 0 --
+    common in a user collection, where forum.json often carries no id -- would
+    collide and abort the whole thread merge. Real Tieba ids are positive, so
+    negative placeholders can never clash with one that shows up later.
+    """
+    row = conn.execute("SELECT MIN(forum_id) FROM forum").fetchone()
+    lowest = row[0] if row and row[0] is not None else 0
+    return min(lowest, 0) - 1
+
+
+def _upsert_forum(conn: sqlite3.Connection, forum_id: int, forum_name: str,
+                  member_num: int = 0, post_num: int = 0, thread_num: int = 0,
+                  slogan: str = ""):
+    """Insert or update one forum row, tolerating id collisions."""
+    existing = conn.execute(
+        "SELECT forum_id FROM forum WHERE forum_name = ?", (forum_name,)).fetchone()
+
+    if existing:
+        # Adopt the reported id only when it is real and nobody else holds it.
+        if forum_id and forum_id != existing[0]:
+            taken = conn.execute(
+                "SELECT 1 FROM forum WHERE forum_id = ? AND forum_name != ?",
+                (forum_id, forum_name)).fetchone()
+            if not taken:
+                conn.execute("UPDATE forum SET forum_id = ? WHERE forum_name = ?",
+                             (forum_id, forum_name))
+        conn.execute(
+            """UPDATE forum SET
+                   member_num = MAX(member_num, ?),
+                   post_num   = MAX(post_num, ?),
+                   thread_num = MAX(thread_num, ?),
+                   slogan     = CASE WHEN ? != '' THEN ? ELSE slogan END
+               WHERE forum_name = ?""",
+            (member_num, post_num, thread_num, slogan, slogan, forum_name),
+        )
+        return
+
+    if not forum_id or conn.execute(
+            "SELECT 1 FROM forum WHERE forum_id = ?", (forum_id,)).fetchone():
+        forum_id = _free_forum_id(conn)
+    conn.execute(
+        """INSERT INTO forum (forum_id, forum_name, member_num, post_num, thread_num, slogan)
+           VALUES (?, ?, ?, ?, ?, ?)""",
+        (forum_id, forum_name, member_num, post_num, thread_num, slogan),
+    )
+
+
 def merge_forum_json(conn: sqlite3.Connection, forum_json_path: str, forum_name: str):
     """Read forum.json and insert/update the forum table."""
     if not os.path.exists(forum_json_path):
-        conn.execute(
-            "INSERT OR IGNORE INTO forum (forum_id, forum_name) VALUES (0, ?)",
-            (forum_name,),
-        )
+        _upsert_forum(conn, 0, forum_name)
         return
 
     with open(forum_json_path, "r", encoding="utf-8") as f:
@@ -120,23 +170,14 @@ def merge_forum_json(conn: sqlite3.Connection, forum_json_path: str, forum_name:
 
     f_data = data.get("forum", data) if "forum" in data else data
 
-    conn.execute(
-        """INSERT INTO forum (forum_id, forum_name, member_num, post_num, thread_num, slogan)
-        VALUES (?, ?, ?, ?, ?, ?)
-        ON CONFLICT(forum_name) DO UPDATE SET
-            forum_id = CASE WHEN excluded.forum_id != 0 THEN excluded.forum_id ELSE forum.forum_id END,
-            member_num = MAX(forum.member_num, excluded.member_num),
-            post_num = MAX(forum.post_num, excluded.post_num),
-            thread_num = MAX(forum.thread_num, excluded.thread_num),
-            slogan = CASE WHEN excluded.slogan != '' THEN excluded.slogan ELSE forum.slogan END""",
-        (
-            f_data.get("id", f_data.get("forum_id", 0)),
-            f_data.get("name", f_data.get("forum_name", forum_name)),
-            f_data.get("member_num", 0),
-            f_data.get("post_num", 0),
-            f_data.get("thread_num", 0),
-            f_data.get("slogan", ""),
-        ),
+    _upsert_forum(
+        conn,
+        f_data.get("id", f_data.get("forum_id", 0)) or 0,
+        f_data.get("name", f_data.get("forum_name", forum_name)),
+        f_data.get("member_num", 0),
+        f_data.get("post_num", 0),
+        f_data.get("thread_num", 0),
+        f_data.get("slogan", ""),
     )
 
 
@@ -249,6 +290,7 @@ def find_thread_dirs(forum_dir: str):
     """Scan a forum directory and find all thread folders."""
     print(f"  Scanning thread folders ...", flush=True)
     results = []
+    skipped = []
     all_entries = os.listdir(forum_dir)
     for i, name in enumerate(all_entries):
         if name.startswith("_"):
@@ -258,10 +300,46 @@ def find_thread_dirs(forum_dir: str):
             continue
         forum_name, tid, title = parse_folder_name(name)
         if tid is not None:
+            if not forum_name:
+                forum_name = _forum_name_from_files(full, tid)
             results.append((full, forum_name, tid, name))
+        else:
+            skipped.append(name)
         if (i + 1) % 5000 == 0:
             print(f"    ... listed {i+1}/{len(all_entries)}, found {len(results)} threads", flush=True)
+    if skipped:
+        # Never drop a folder without saying so: an unparsable name used to mean
+        # the thread quietly never got merged.
+        print(f"  [WARN] {len(skipped)} folder(s) did not match the expected "
+              f"[forum吧][tid]title layout and were skipped:")
+        for name in skipped[:10]:
+            print(f"         {name}")
+        if len(skipped) > 10:
+            print(f"         ... and {len(skipped) - 10} more")
     return results
+
+
+def _forum_name_from_files(thread_folder: str, tid: int) -> str:
+    """Recover a forum name the folder name does not carry, from the saved JSON."""
+    thread_dir = os.path.join(thread_folder, "threads", str(tid))
+    if not os.path.isdir(thread_dir):
+        thread_dir = thread_folder
+    for fname, keys in (("forum.json", ("name", "forum_name")),
+                        ("thread.json", ("forum_name", "fname"))):
+        path = os.path.join(thread_dir, fname)
+        if not os.path.exists(path):
+            continue
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except (OSError, ValueError):
+            continue
+        blob = data.get("forum", data) if isinstance(data, dict) else {}
+        for key in keys:
+            value = (blob or {}).get(key) or (data.get(key) if isinstance(data, dict) else None)
+            if value:
+                return str(value)
+    return ""
 
 
 def merge_stub_threads(conn: sqlite3.Connection, source_forum_dir: str, forum_name: str, merged_tids: set):
@@ -425,12 +503,18 @@ def merge_one_forum(source_forum_dir: str, forum_dir_name: str, output_dir: str)
 
     # ── Open data.tar + load asset index for single-pass packing ──
     index_path = os.path.join(out_forum_dir, "data_index.json")
-    index_data = {"tar_file": "data.tar", "files": {}}
+    tar_filename = "data.tar"
+    index_data = {"version": 2, "tars": [tar_filename], "tar_file": tar_filename, "files": {}}
     if os.path.exists(index_path):
         with open(index_path, "r", encoding="utf-8") as f:
             index_data = json.load(f)
-            index_data.setdefault("tar_file", "data.tar")
+            index_data.setdefault("tar_file", tar_filename)
             index_data.setdefault("files", {})
+            index_data["version"] = 2
+            tars = set(index_data.get("tars") or [index_data["tar_file"]])
+            tars.add(tar_filename)
+            index_data["tars"] = sorted(tars)
+    identity_map = build_identity_map(index_data["files"])
     packed_tids = set()
     for p in index_data["files"]:
         tid_str = p.split("/")[0]
@@ -484,14 +568,17 @@ def merge_one_forum(source_forum_dir: str, forum_dir_name: str, output_dir: str)
                 # 2. Pack assets in the same pass (skip if already packed)
                 if tid not in packed_tids:
                     for disk_path, internal_path in _collect_asset_files(folder_path, tid):
-                        if internal_path in index_data["files"]:
+                        if reuse_existing_asset(index_data["files"], identity_map,
+                                                internal_path, disk_path):
                             continue
                         try:
                             info = tf.gettarinfo(disk_path, arcname=internal_path)
                             offset = tf.offset
                             with open(disk_path, "rb") as fh:
                                 tf.addfile(info, fh)
-                            index_data["files"][internal_path] = {"offset": offset, "size": info.size}
+                            entry = {"tar": tar_filename, "offset": offset, "size": info.size}
+                            index_data["files"][internal_path] = entry
+                            identity_map.setdefault(asset_identity(internal_path), entry)
                             total_files += 1
                         except (PermissionError, OSError):
                             pass
@@ -552,6 +639,54 @@ def merge_one_forum(source_forum_dir: str, forum_dir_name: str, output_dir: str)
         print(f"  ({errors} merge errors)")
 
     conn.close()
+
+
+ASSET_STAMP_RE = re.compile(r"^(.*)_\d{16}(\.[^.]+)$")
+
+
+def asset_identity(internal_path: str) -> str:
+    """Strip the trailing scrape timestamp so re-downloads of one asset collapse.
+
+    Saved asset names carry a 16-digit microsecond stamp of the moment they were
+    fetched, e.g. `<tid>/user_avatar/tb.1.abc.XYZ_1781633390107401.jpeg`. The part
+    before the stamp is the asset's identity on Tieba's side, so two genuinely
+    different pictures never share it, while the same picture fetched in a later
+    run does. Returned identities keep the tid prefix, so grouping stays inside a
+    single thread and per-thread archives remain self-contained.
+    """
+    m = ASSET_STAMP_RE.match(internal_path)
+    return f"{m.group(1)}{m.group(2)}" if m else internal_path
+
+
+def build_identity_map(files: dict) -> dict:
+    """Map asset identity -> existing index entry, for re-download detection."""
+    identity_map = {}
+    for path, info in files.items():
+        identity_map.setdefault(asset_identity(path), info)
+    return identity_map
+
+
+def reuse_existing_asset(files: dict, identity_map: dict, internal_path: str,
+                         disk_path: str) -> bool:
+    """Point a re-downloaded asset at the copy already in the tar.
+
+    Returns True when the entry was satisfied without appending bytes. The new
+    path still gets its own index entry, so posts referring to it keep resolving;
+    only the duplicate bytes are avoided. A size mismatch means the asset really
+    changed, so it is stored separately.
+    """
+    if internal_path in files:
+        return True
+    prev = identity_map.get(asset_identity(internal_path))
+    if prev is None:
+        return False
+    try:
+        if os.path.getsize(disk_path) != prev.get("size"):
+            return False
+    except OSError:
+        return False
+    files[internal_path] = dict(prev)
+    return True
 
 
 def _collect_asset_files(thread_folder: str, tid: int):

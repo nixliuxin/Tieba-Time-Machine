@@ -378,13 +378,24 @@ def cmd_heal(args):
             index_data.setdefault("tar_file", "data.tar")
             index_data.setdefault("files", {})
 
-    tar_full = os.path.join(archive_dir, index_data.get("tar_file", "data.tar"))
+    # 新字节一律追加到归档的主 tar；索引里每条记清楚自己属于哪个 tar，
+    # 这样早期 pipeline 留下的 media.tar 里的成员照样能被找到。
+    tar_name = index_data.get("tar_file") or "data.tar"
+    index_data["version"] = 2
+    tars = set(index_data.get("tars") or [tar_name])
+    tars.add(tar_name)
+    index_data["tars"] = sorted(tars)
+    identity_map = ma.build_identity_map(index_data["files"])
+
+    tar_full = os.path.join(archive_dir, tar_name)
     tar_mode = "a" if os.path.exists(tar_full) else "w"
     tf = tarfile.open(tar_full, f"{tar_mode}:")
 
     new_posts_before = conn.execute("SELECT COUNT(*) FROM post").fetchone()[0]
     new_assets = 0
+    reused_assets = 0
     errors = 0
+    error_tids = []
     try:
         for folder_path, forum_name, tid, folder_name in threads:
             thread_dir = os.path.join(folder_path, "threads", str(tid))
@@ -408,19 +419,26 @@ def cmd_heal(args):
                 )
 
                 for disk_path, internal_path in ma._collect_asset_files(folder_path, tid):
-                    if internal_path in index_data["files"]:
-                        continue  # 已有，跳过（去重）
+                    # 重抓会把同一张图按新的时间戳文件名再存一次。给新路径建索引条目
+                    # 指向已存的那份字节：帖子引用照常解析，不再重复占空间。
+                    if ma.reuse_existing_asset(index_data["files"], identity_map,
+                                               internal_path, disk_path):
+                        reused_assets += 1
+                        continue
                     try:
                         info = tf.gettarinfo(disk_path, arcname=internal_path)
                         offset = tf.offset
                         with open(disk_path, "rb") as fh:
                             tf.addfile(info, fh)
-                        index_data["files"][internal_path] = {"offset": offset, "size": info.size}
+                        entry = {"tar": tar_name, "offset": offset, "size": info.size}
+                        index_data["files"][internal_path] = entry
+                        identity_map.setdefault(ma.asset_identity(internal_path), entry)
                         new_assets += 1
                     except (PermissionError, OSError):
                         pass
             except Exception as e:
                 errors += 1
+                error_tids.append(tid)
                 if errors <= 5:
                     print(f"  [ERROR] tid={tid}: {e}")
                 continue
@@ -450,8 +468,14 @@ def cmd_heal(args):
 
     new_posts_after = conn.execute("SELECT COUNT(*) FROM post").fetchone()[0]
     added = new_posts_after - new_posts_before
-    print(f"  新增楼层/回复 {added} 条，新增媒体 {new_assets} 个，复活(误删/失败→完整) {revived} 帖"
+    print(f"  新增楼层/回复 {added} 条，新增媒体 {new_assets} 个，"
+          f"复用已存媒体 {reused_assets} 个，复活(误删/失败→完整) {revived} 帖"
           + (f"，错误 {errors}" if errors else ""))
+    if error_tids:
+        # 全部列出：只打印前几条会让中间失败的帖子悄悄消失。
+        print(f"  [注意] 以下 {len(error_tids)} 帖未能并回，需要复查:")
+        for chunk in range(0, len(error_tids), 10):
+            print("        " + " ".join(str(t) for t in error_tids[chunk:chunk + 10]))
 
     # 楼层补齐后重建 FTS（幂等：数量一致则跳过）
     total_posts = new_posts_after
